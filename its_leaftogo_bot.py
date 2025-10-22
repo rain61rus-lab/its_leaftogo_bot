@@ -38,7 +38,7 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Задай BOT_TOKEN в Secrets.")
 
 # Впиши здесь СВОЙ user_id. Узнать командой /whoami, затем замени 123456789 на свой ID.
-HARD_ADMIN_IDS = {123456789}
+HARD_ADMIN_IDS = {826495316}
 
 # Можно также указать через ENV (необязательно). Итоговый список админов = HARD_ADMIN_IDS ∪ ENV_ADMIN_IDS.
 ENV_ADMIN_IDS = {
