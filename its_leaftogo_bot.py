@@ -38,7 +38,7 @@ if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Задай BOT_TOKEN в Secrets.")
 
 # Впиши здесь СВОЙ user_id. Узнать командой /whoami, затем замени 123456789 на свой ID.
-HARD_ADMIN_IDS = {826495316}
+HARD_ADMIN_IDS = {123456789}
 
 # Можно также указать через ENV (необязательно). Итоговый список админов = HARD_ADMIN_IDS ∪ ENV_ADMIN_IDS.
 ENV_ADMIN_IDS = {
@@ -684,7 +684,8 @@ async def cmd_journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         id_, desc, aname, aid, started, done, created, reason = i
         dur = human_duration(started, done)
         who = aname or aid or "—"
-        line = f"#{id_} • {who} • Взята: {fmt_dt(started)} • Готово: {fmt_dt(done)} • Длит.: {dur}\n{desc}"
+        # ⬇️ ТЕПЕРЬ показываем «Создана», чтобы видно было, когда подана заявка
+        line = f"#{id_} • {who}\nСоздана: {fmt_dt(created)} • Взята: {fmt_dt(started)} • Готово: {fmt_dt(done)} • Длит.: {dur}\n{desc}"
         if reason:
             line += f"\nПричина: {reason}"
         lines.append(line)
@@ -885,7 +886,11 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not admin and t.get("assignee_id") != uid:
             await query.answer("Только исполнитель или админ может закрыть.")
             return
-        await update_ticket(db, tid, status=STATUS_DONE, done_at=now_utc().isoformat())
+        now_iso = now_utc().isoformat()
+        # Если работу закрывают без шага «⏱ В работу», выставим started_at = created_at (fallback),
+        # чтобы длительность считалась корректно и в журнале всё было видно.
+        started_val = t.get("started_at") or t.get("created_at") or now_iso
+        await update_ticket(db, tid, status=STATUS_DONE, started_at=started_val, done_at=now_iso)
         await query.edit_message_text((query.message.text or "") + "\n\nСтатус: ✅ Выполнена")
         return
 
