@@ -1,7 +1,8 @@
 # its_helpdesk_bot.py
-# Бот ИТС: ремонты/покупки, роли (админ/механик), горячие клавиши,
-# комментарии, причины при отмене/отклонении, время started/done/длительность,
-# журнал и экспорт, назначение механику из меню.
+# ИТС-бот с ролями (админ/механик), горячими клавишами,
+# ремонты/покупки, причины при отмене/отклонении,
+# учёт времени (start/done/длительность),
+# журнал с описанием и исполнителем, кнопка "Заявки на ремонт".
 # Требуется: python-telegram-bot==20.7, aiosqlite
 
 import os, asyncio, aiosqlite, csv, io
@@ -72,16 +73,6 @@ CREATE TABLE IF NOT EXISTS tickets (
 CREATE INDEX IF NOT EXISTS idx_tickets_kind   ON tickets(kind);
 CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
 CREATE INDEX IF NOT EXISTS idx_tickets_user   ON tickets(user_id);
-
-CREATE TABLE IF NOT EXISTS comments (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ticket_id INTEGER NOT NULL,
-  user_id INTEGER NOT NULL,
-  username TEXT,
-  text TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_comments_ticket ON comments(ticket_id);
 """
 
 async def init_db():
@@ -132,25 +123,6 @@ async def find_tickets(kind:Optional[str]=None, status:Optional[str]=None,
         cur = await db.execute(q,p)
         return await cur.fetchall()
 
-async def add_comment(ticket_id:int, user_id:int, username:str, text:str) -> int:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO comments(ticket_id,user_id,username,text,created_at) VALUES (?,?,?,?,?)",
-            (ticket_id, user_id, username or "", text, now_iso())
-        )
-        await db.commit()
-        cur = await db.execute("SELECT last_insert_rowid()")
-        (cid,) = await cur.fetchone()
-        return cid
-
-async def list_comments(ticket_id:int, limit:int=50):
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute(
-            "SELECT user_id,username,text,created_at FROM comments WHERE ticket_id=? ORDER BY id LIMIT ?",
-            (ticket_id, limit)
-        )
-        return await cur.fetchall()
-
 # ---------- формат/кнопки ----------
 def fmt_ticket(row) -> str:
     (id, kind, status, prio, chat_id, user_id, username,
@@ -176,9 +148,7 @@ def fmt_ticket(row) -> str:
         lines.append(f"👨‍🔧 Исполнитель: {assignee_name or assignee_id}")
     return "\n".join(lines)
 
-from telegram import InlineKeyboardMarkup, InlineKeyboardButton
-
-def kb_repair_admin(tid:int, admin:bool, is_assignee:bool, tech:bool=False) -> InlineKeyboardMarkup:
+def kb_repair(tid:int, admin:bool, is_assignee:bool, tech:bool=False) -> InlineKeyboardMarkup:
     rows = []
     if admin:
         rows.append([
@@ -195,7 +165,6 @@ def kb_repair_admin(tid:int, admin:bool, is_assignee:bool, tech:bool=False) -> I
             InlineKeyboardButton("Приоритет ↑", callback_data=f"prio_up:{tid}"),
             InlineKeyboardButton("Отменить (с причиной)", callback_data=f"cancel_with_reason:{tid}")
         ])
-    rows.append([InlineKeyboardButton("💬 Комментарии", callback_data=f"show_comments:{tid}")])
     return InlineKeyboardMarkup(rows)
 
 def kb_assign_list(tid:int) -> InlineKeyboardMarkup:
@@ -212,8 +181,7 @@ def kb_assign_list(tid:int) -> InlineKeyboardMarkup:
 def kb_purchase_admin(tid:int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Одобрить", callback_data=f"approve_{tid}"),
-         InlineKeyboardButton("❌ Отклонить (с причиной)", callback_data=f"reject_with_reason_{tid}")],
-        [InlineKeyboardButton("💬 Комментарии", callback_data=f"show_comments:{tid}")]
+         InlineKeyboardButton("❌ Отклонить (с причиной)", callback_data=f"reject_with_reason_{tid}")]
     ])
 
 # ---------- команды ----------
@@ -222,24 +190,24 @@ async def cmd_start(u:Update, c:ContextTypes.DEFAULT_TYPE):
     isadm, istec = is_admin(uid), is_tech(uid)
     kb = [
         [KeyboardButton("🛠 Новая заявка"), KeyboardButton("🧾 Мои заявки")],
-        [KeyboardButton("🛒 Покупка")]
+        [KeyboardButton("🛒 Покупка")],
+        [KeyboardButton("🛠 Заявки на ремонт")]
     ]
-    if isadm or istec:
-        kb.append([KeyboardButton("🛠 Админ")])
     if isadm:
         kb.append([KeyboardButton("🛒 Покупки")])
         kb.append([KeyboardButton("📓 Журнал")])
     reply_kb = ReplyKeyboardMarkup(kb, resize_keyboard=True)
 
-    txt = [
-        "Привет! Это бот инженерно-технической службы.",
-        "• Кнопки ниже — быстрые действия.",
-        "• Комментарий: `/comment #<id> <текст>`",
-        "• Смотреть комментарии: `/comments #<id>`"
-    ]
-    if isadm: txt += ["\\nАдмин-команды: /find, /export, /journal"]
-    await u.message.reply_text("\\n".join(txt), parse_mode="Markdown",
-                               disable_web_page_preview=True, reply_markup=reply_kb)
+    await u.message.reply_text(
+        "Привет это робот инженерно технической службы",
+        reply_markup=reply_kb
+    )
+
+async def cmd_my(u:Update, c:ContextTypes.DEFAULT_TYPE):
+    rows = await find_tickets(user_id=u.effective_user.id, limit=20)
+    if not rows:
+        await u.message.reply_text("У тебя пока нет заявок."); return
+    await u.message.reply_text("\n\n".join(map(fmt_ticket, rows)))
 
 async def cmd_new(u:Update, c:ContextTypes.DEFAULT_TYPE):
     if not c.args:
@@ -249,7 +217,7 @@ async def cmd_new(u:Update, c:ContextTypes.DEFAULT_TYPE):
     tid = await add_ticket("repair", u.effective_chat.id, u.effective_user.id, u.effective_user.username, descr)
     await u.message.reply_text(f"🛠 Заявка №{tid} создана.")
     for aid in ADMIN_IDS:
-        try: await c.bot.send_message(aid, f"🛠 Новая заявка №{tid}\\n{descr}")
+        try: await c.bot.send_message(aid, f"🛠 Новая заявка №{tid}\n{descr}")
         except: pass
 
 async def any_photo(u:Update, c:ContextTypes.DEFAULT_TYPE):
@@ -260,7 +228,7 @@ async def any_photo(u:Update, c:ContextTypes.DEFAULT_TYPE):
     tid = await add_ticket("repair", u.effective_chat.id, u.effective_user.id, u.effective_user.username, u.message.caption, photo_id=photo_id)
     await u.message.reply_text(f"🛠 Заявка с фото №{tid} создана.")
     for aid in ADMIN_IDS:
-        try: await c.bot.send_message(aid, f"🛠 Новая заявка №{tid}\\n{u.message.caption}")
+        try: await c.bot.send_message(aid, f"🛠 Новая заявка №{tid}\n{u.message.caption}")
         except: pass
 
 async def cmd_buy(u:Update, c:ContextTypes.DEFAULT_TYPE):
@@ -273,21 +241,33 @@ async def cmd_buy(u:Update, c:ContextTypes.DEFAULT_TYPE):
     for aid in ADMIN_IDS:
         try:
             await c.bot.send_message(aid,
-                f"🛒 Новая заявка на покупку №{tid}\\nОт @{u.effective_user.username or u.effective_user.id}\\n— {descr}",
+                f"🛒 Новая заявка на покупку №{tid}\nОт @{u.effective_user.username or u.effective_user.id}\n— {descr}",
                 reply_markup=kb_purchase_admin(tid))
         except: pass
 
-async def cmd_my(u:Update, c:ContextTypes.DEFAULT_TYPE):
-    rows = await find_tickets(user_id=u.effective_user.id, limit=20)
-    if not rows: await u.message.reply_text("У тебя пока нет заявок."); return
-    await u.message.reply_text("\\n\\n".join(map(fmt_ticket, rows)))
-
-async def cmd_admin(u:Update, c:ContextTypes.DEFAULT_TYPE):
-    if not (is_admin(u.effective_user.id) or is_tech(u.effective_user.id)): return
-    rows = await find_tickets(kind="repair", status="new", limit=20)
-    if not rows: await u.message.reply_text("Новых заявок на ремонт нет."); return
-    for r in rows:
-        await u.message.reply_text(fmt_ticket(r), reply_markup=kb_repair_admin(r[0], is_admin(u.effective_user.id), False, tech=is_tech(u.effective_user.id)))
+async def cmd_repairs(u:Update, c:ContextTypes.DEFAULT_TYPE):
+    """Кнопка 'Заявки на ремонт':
+       - Админ: показывает новые ремонты (status=new) с кнопками
+       - Механик: показывает свои 'в работе' (status=in_work, assignee=он)
+    """
+    uid = u.effective_user.id
+    if is_admin(uid):
+        rows = await find_tickets(kind="repair", status="new", limit=20)
+        if not rows: await u.message.reply_text("Новых заявок на ремонт нет."); return
+        for r in rows:
+            await u.message.reply_text(fmt_ticket(r), reply_markup=kb_repair(r[0], True, False, tech=False))
+    elif is_tech(uid):
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute(
+                "SELECT * FROM tickets WHERE kind='repair' AND status='in_work' AND assignee_id=? ORDER BY id DESC LIMIT 20",
+                (uid,)
+            )
+            rows = await cur.fetchall()
+        if not rows: await u.message.reply_text("У тебя пока нет заявок 'в работе'."); return
+        for r in rows:
+            await u.message.reply_text(fmt_ticket(r), reply_markup=kb_repair(r[0], False, True, tech=True))
+    else:
+        await u.message.reply_text("Недостаточно прав.")
 
 async def cmd_purchases(u:Update, c:ContextTypes.DEFAULT_TYPE):
     if not is_admin(u.effective_user.id): return
@@ -295,40 +275,6 @@ async def cmd_purchases(u:Update, c:ContextTypes.DEFAULT_TYPE):
     if not rows: await u.message.reply_text("Новых заявок на покупку нет."); return
     for r in rows:
         await u.message.reply_text(fmt_ticket(r), reply_markup=kb_purchase_admin(r[0]))
-
-async def cmd_comment(u:Update, c:ContextTypes.DEFAULT_TYPE):
-    if not c.args or not c.args[0].startswith("#"):
-        await u.message.reply_text("Используй: /comment #<id> <текст>")
-        return
-    tid_s = c.args[0][1:]
-    if not tid_s.isdigit(): await u.message.reply_text("Неверный номер заявки."); return
-    tid = int(tid_s)
-    text = " ".join(c.args[1:]).strip()
-    if not text: await u.message.reply_text("Добавь текст комментария."); return
-    row = await get_ticket(tid)
-    if not row: await u.message.reply_text("Заявка не найдена."); return
-    await add_comment(tid, u.effective_user.id, u.effective_user.username, text)
-    await u.message.reply_text(f"💬 Комментарий добавлен к заявке №{tid}.")
-    author_id, assignee_id = row[5], row[9]
-    for tgt in (author_id, assignee_id):
-        if tgt and tgt != u.effective_user.id:
-            try: await c.bot.send_message(tgt, f"💬 Комментарий по заявке №{tid} от @{u.effective_user.username or u.effective_user.id}: {text}")
-            except: pass
-
-async def cmd_comments(u:Update, c:ContextTypes.DEFAULT_TYPE):
-    if not c.args or not c.args[0].startswith("#"):
-        await u.message.reply_text("Используй: /comments #<id>"); return
-    tid_s = c.args[0][1:]
-    if not tid_s.isdigit(): await u.message.reply_text("Неверный номер заявки."); return
-    tid = int(tid_s)
-    row = await get_ticket(tid)
-    if not row: await u.message.reply_text("Заявка не найдена."); return
-    comms = await list_comments(tid, 50)
-    if not comms: await u.message.reply_text("Комментариев пока нет."); return
-    lines = [f"💬 Комментарии к заявке №{tid}:"]
-    for (uid, uname, text, created) in comms:
-        lines.append(f"— @{uname or uid} [{created.replace('T',' ')}]: {text}")
-    await u.message.reply_text("\\n".join(lines))
 
 async def cmd_find(u:Update, c:ContextTypes.DEFAULT_TYPE):
     if not is_admin(u.effective_user.id): return
@@ -341,7 +287,7 @@ async def cmd_find(u:Update, c:ContextTypes.DEFAULT_TYPE):
         await u.message.reply_text(fmt_ticket(row) if row else "Не найдено.")
         return
     rows = await find_tickets(phrase=q, limit=20)
-    await u.message.reply_text("\\n\\n".join(map(fmt_ticket, rows)) if rows else "Не найдено.")
+    await u.message.reply_text("\n\n".join(map(fmt_ticket, rows)) if rows else "Не найдено.")
 
 async def cmd_export(u:Update, c:ContextTypes.DEFAULT_TYPE):
     if not is_admin(u.effective_user.id): return
@@ -362,38 +308,40 @@ async def cmd_export(u:Update, c:ContextTypes.DEFAULT_TYPE):
                                    caption=f"Экспорт за {period}")
 
 async def cmd_journal(u:Update, c:ContextTypes.DEFAULT_TYPE):
+    """Журнал: какая заявка, текст, кто взял, время взятия и выполнения"""
     if not is_admin(u.effective_user.id): return
     days = 30
     if c.args and c.args[0].isdigit(): days = max(1, min(365, int(c.args[0])))
     since = datetime.utcnow() - timedelta(days=days)
     async with aiosqlite.connect(DB_PATH) as db:
         cur = await db.execute(
-            "SELECT id,description,created_at,started_at,done_at FROM tickets "
-            "WHERE kind='repair' AND status='done' AND created_at>=? ORDER BY id DESC LIMIT 200",
+            "SELECT id,description,assignee_name,started_at,done_at FROM tickets "
+            "WHERE kind='repair' AND status='done' AND created_at>=? "
+            "ORDER BY id DESC LIMIT 200",
             (since.isoformat(timespec='seconds'),)
         )
         rows = await cur.fetchall()
     if not rows: await u.message.reply_text(f"Завершённых ремонтов за {days} дн. нет."); return
-    lines = [f"🧾 Журнал завершённых ремонтов (последние {len(rows)}):"]
-    for (tid, descr, created, started, done) in rows:
+    lines = [f"🧾 Журнал (последние {len(rows)}):"]
+    for (tid, descr, assignee, started, done) in rows:
         dur = human_duration(started, done)
-        lines.append(f"#{tid} • ⏱ {created.replace('T',' ')} → 🔧 {str(started).replace('T',' ') if started else '—'} → ✅ {str(done).replace('T',' ') if done else '—'} • ⌛ {dur}\\n— {descr}")
+        lines.append(f"#{tid} • 👨‍🔧 {assignee or '—'} • 🔧 {str(started).replace('T',' ') if started else '—'} → ✅ {str(done).replace('T',' ') if done else '—'} • ⌛ {dur}\n— {descr}")
     chunk, chunks = "", []
     for ln in lines:
         if len(chunk)+len(ln)+1 > 3800:
             chunks.append(chunk); chunk=""
-        chunk += ln+"\\n"
+        chunk += ln+"\n"
     if chunk: chunks.append(chunk)
     for part in chunks:
         await u.message.reply_text(part)
 
-# ---------- текст/горячие клавиши ----------
+# ---------- текст / горячие клавиши ----------
 async def any_text(u:Update, c:ContextTypes.DEFAULT_TYPE):
     uid = u.effective_user.id
     text = (u.message.text or "").strip()
 
     # Горячие клавиши
-    if text in ("🛠 Новая заявка", "🧾 Мои заявки", "🛒 Покупка", "🛠 Админ", "🛒 Покупки", "📓 Журнал"):
+    if text in ("🛠 Новая заявка", "🧾 Мои заявки", "🛒 Покупка", "🛠 Заявки на ремонт", "🛒 Покупки", "📓 Журнал"):
         if text == "🛠 Новая заявка":
             PENDING_NEW[uid] = "repair"
             await u.message.reply_text("Опиши проблему одним сообщением — создам заявку на ремонт."); return
@@ -402,32 +350,27 @@ async def any_text(u:Update, c:ContextTypes.DEFAULT_TYPE):
             await u.message.reply_text("Напиши, что купить и для чего — создам заявку на покупку."); return
         if text == "🧾 Мои заявки":
             await cmd_my(u,c); return
-        if text == "🛠 Админ":
-            if is_admin(uid) or is_tech(uid): await cmd_admin(u,c)
-            else: await u.message.reply_text("Недостаточно прав.")
-            return
+        if text == "🛠 Заявки на ремонт":
+            await cmd_repairs(u,c); return
         if text == "🛒 Покупки":
             if is_admin(uid): await cmd_purchases(u,c)
-            else: await u.message.reply_text("Недостаточно прав.")
-            return
+            else: await u.message.reply_text("Недостаточно прав."); return
         if text == "📓 Журнал":
             if is_admin(uid): await cmd_journal(u,c)
-            else: await u.message.reply_text("Недостаточно прав.")
-            return
+            else: await u.message.reply_text("Недостаточно прав."); return
 
-    # причина (админ)
+    # Причины (отмена/отклонение) — только для админа
     if is_admin(uid) and uid in PENDING_REASON:
         action, tid = PENDING_REASON.pop(uid)
         reason = text
         if not reason:
-            await u.message.reply_text("Причина не должна быть пустой. Напиши текст причины."); PENDING_REASON[uid]=(action, tid); return
+            await u.message.reply_text("Причина не должна быть пустой. Напиши текст причины.")
+            PENDING_REASON[uid]=(action, tid); return
         if action == "reject_purchase":
             await update_ticket(tid, status="rejected")
-            await add_comment(tid, uid, u.effective_user.username, f"Отклонено: {reason}")
             await u.message.reply_text(f"🛒 Заявка №{tid} отклонена. Причина сохранена.")
         elif action == "cancel_repair":
             await update_ticket(tid, status="canceled")
-            await add_comment(tid, uid, u.effective_user.username, f"Отменено: {reason}")
             await u.message.reply_text(f"🛠 Заявка №{tid} отменена. Причина сохранена.")
         row = await get_ticket(tid)
         if row:
@@ -437,14 +380,14 @@ async def any_text(u:Update, c:ContextTypes.DEFAULT_TYPE):
             except: pass
         return
 
-    # ожидание текста новой заявки
+    # Ожидаем текст после нажатия «Новая заявка/Покупка»
     if uid in PENDING_NEW:
         mode = PENDING_NEW.pop(uid)
         if mode == "repair":
             tid = await add_ticket("repair", u.effective_chat.id, uid, u.effective_user.username, text)
             await u.message.reply_text(f"🛠 Заявка №{tid} создана.")
             for aid in ADMIN_IDS:
-                try: await c.bot.send_message(aid, f"🛠 Новая заявка №{tid}\\n{text}")
+                try: await c.bot.send_message(aid, f"🛠 Новая заявка №{tid}\n{text}")
                 except: pass
             return
         else:
@@ -453,18 +396,18 @@ async def any_text(u:Update, c:ContextTypes.DEFAULT_TYPE):
             for aid in ADMIN_IDS:
                 try:
                     await c.bot.send_message(aid,
-                        f"🛒 Новая заявка на покупку №{tid}\\nОт @{u.effective_user.username or uid}\\n— {text}",
+                        f"🛒 Новая заявка на покупку №{tid}\nОт @{u.effective_user.username or uid}\n— {text}",
                         reply_markup=kb_purchase_admin(tid))
                 except: pass
             return
 
-    # обычный текст → ремонт
+    # Обычный текст → заявка на ремонт
     if not text or text.startswith("/"):
         return
     tid = await add_ticket("repair", u.effective_chat.id, uid, u.effective_user.username, text)
     await u.message.reply_text(f"🛠 Заявка №{tid} создана.")
     for aid in ADMIN_IDS:
-        try: await c.bot.send_message(aid, f"🛠 Новая заявка №{tid}\\n{text}")
+        try: await c.bot.send_message(aid, f"🛠 Новая заявка №{tid}\n{text}")
         except: pass
 
 # ---------- кнопки ----------
@@ -472,19 +415,6 @@ async def on_btn(u:Update, c:ContextTypes.DEFAULT_TYPE):
     q = u.callback_query
     await q.answer()
     data = q.data
-
-    # Показ комментариев
-    if data.startswith("show_comments:"):
-        tid = int(data.split(":")[1])
-        comms = await list_comments(tid, 50)
-        if not comms:
-            await q.answer("Комментариев нет.", show_alert=True); return
-        lines = [f"💬 Комментарии к заявке №{tid}:"]
-        for (uid, uname, text, created) in comms:
-            lines.append(f"— @{uname or uid} [{created.replace('T',' ')}]: {text}")
-        try: await q.edit_message_text("\\n".join(lines))
-        except: pass
-        return
 
     # Меню назначения механику
     if data.startswith("assign_menu:"):
@@ -504,11 +434,11 @@ async def on_btn(u:Update, c:ContextTypes.DEFAULT_TYPE):
             is_assignee = (row[9] == q.from_user.id)
             try:
                 await q.edit_message_reply_markup(
-                    reply_markup=kb_repair_admin(tid, True, is_assignee, tech=False)
+                    reply_markup=kb_repair(tid, True, is_assignee, tech=False)
                 )
             except:
                 await q.message.reply_text(fmt_ticket(row),
-                    reply_markup=kb_repair_admin(tid, True, is_assignee, tech=False))
+                    reply_markup=kb_repair(tid, True, is_assignee, tech=False))
         return
 
     if data.startswith("assign_to:"):
@@ -520,18 +450,20 @@ async def on_btn(u:Update, c:ContextTypes.DEFAULT_TYPE):
         row = await get_ticket(tid)
         try:
             await q.edit_message_text(fmt_ticket(row),
-                reply_markup=kb_repair_admin(tid, True, is_assignee=False, tech=False))
+                reply_markup=kb_repair(tid, True, is_assignee=False, tech=False))
         except:
             await q.message.reply_text(fmt_ticket(row),
-                reply_markup=kb_repair_admin(tid, True, is_assignee=False, tech=False))
+                reply_markup=kb_repair(tid, True, is_assignee=False, tech=False))
         try: await c.bot.send_message(who, f"🔔 Вам назначена заявка №{tid}")
         except: pass
         return
 
-    # Покупки
+    # Покупки: одобрить / отклонить с причиной
     if data.startswith("approve_") or data.startswith("reject_with_reason_"):
         tid = int(data.rsplit("_", 1)[1])
         if data.startswith("approve_"):
+            if not is_admin(q.from_user.id):
+                await q.answer("Недостаточно прав", show_alert=True); return
             await update_ticket(tid, status="approved")
             try: await q.edit_message_text(f"🛒 Заявка №{tid} одобрена ✅")
             except: pass
@@ -570,7 +502,7 @@ async def on_btn(u:Update, c:ContextTypes.DEFAULT_TYPE):
         row = await get_ticket(tid)
         try:
             await q.edit_message_text(fmt_ticket(row),
-                reply_markup=kb_repair_admin(tid, True, True, tech=False))
+                reply_markup=kb_repair(tid, True, True, tech=False))
         except: pass
         return
 
@@ -586,7 +518,7 @@ async def on_btn(u:Update, c:ContextTypes.DEFAULT_TYPE):
         try:
             await q.edit_message_text(
                 fmt_ticket(row),
-                reply_markup=kb_repair_admin(tid, admin, is_assignee=(row[9]==uid), tech=is_tech(uid))
+                reply_markup=kb_repair(tid, admin, is_assignee=(row[9]==uid), tech=is_tech(uid))
             )
         except: pass
         return
@@ -607,7 +539,7 @@ async def on_btn(u:Update, c:ContextTypes.DEFAULT_TYPE):
         row = await get_ticket(tid)
         try:
             await q.edit_message_text(fmt_ticket(row),
-                reply_markup=kb_repair_admin(tid, admin, is_assignee, tech=is_tech(uid)))
+                reply_markup=kb_repair(tid, admin, is_assignee, tech=is_tech(uid)))
         except: pass
         return
 
@@ -628,10 +560,8 @@ async def main():
     app.add_handler(CommandHandler("new",     cmd_new))
     app.add_handler(CommandHandler("buy",     cmd_buy))
     app.add_handler(CommandHandler("my",      cmd_my))
-    app.add_handler(CommandHandler("admin",   cmd_admin))
+    app.add_handler(CommandHandler("repairs", cmd_repairs))
     app.add_handler(CommandHandler("purchases", cmd_purchases))
-    app.add_handler(CommandHandler("comment", cmd_comment))
-    app.add_handler(CommandHandler("comments", cmd_comments))
     app.add_handler(CommandHandler("find",    cmd_find))
     app.add_handler(CommandHandler("export",  cmd_export))
     app.add_handler(CommandHandler("journal", cmd_journal))
@@ -639,7 +569,7 @@ async def main():
     app.add_handler(MessageHandler(filters.PHOTO, any_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, any_text))
 
-    print("ITS bot running...\\nBot is polling for updates...")
+    print("ITS bot running...\nBot is polling for updates...")
     await app.run_polling()
 
 if __name__ == "__main__":
