@@ -1,12 +1,14 @@
-# its_helpdesk_bot_updated_full.py
+# its_helpdesk_bot.py
 # Telegram bot for IT/Engineering service desk
 # Requires: python-telegram-bot==20.7, aiosqlite
-# Run: BOT_TOKEN=... ADMIN_IDS=12345 TECH_IDS=67890 python its_helpdesk_bot_updated_full.py
+# Run: BOT_TOKEN=... python its_helpdesk_bot.py
+#
+# ВАЖНО: Впиши свой Telegram user_id в HARD_ADMIN_IDS ниже (после /whoami).
+# Админ добавляет механиков командой /add_tech <user_id|@username>.
 
 import os
 import io
 import csv
-import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -29,21 +31,24 @@ from telegram.ext import (
     filters,
 )
 
-# ------------------ CONFIG & LOGGING ------------------
+# ------------------ НАСТРОЙКИ ------------------
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set in environment variables.")
+    raise RuntimeError("BOT_TOKEN is not set. Задай BOT_TOKEN в Secrets.")
 
-# ENV roles (optional)
+# Впиши здесь СВОЙ user_id. Узнать командой /whoami, затем замени 123456789 на свой ID.
+HARD_ADMIN_IDS = {123456789}
+
+# Можно также указать через ENV (необязательно). Итоговый список админов = HARD_ADMIN_IDS ∪ ENV_ADMIN_IDS.
 ENV_ADMIN_IDS = {
     int(x) for x in os.getenv("ADMIN_IDS", "").replace(",", " ").split() if x.isdigit()
 }
-ENV_TECH_IDS = {
-    int(x) for x in os.getenv("TECH_IDS", "").replace(",", " ").split() if x.isdigit()
-}
+# Техников через ENV НЕ задаём — их добавляет админ через /add_tech.
+ENV_TECH_IDS: set[int] = set()
 
-# Logging
+# ------------------ ЛОГИ ------------------
+
 os.makedirs("logs", exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
@@ -55,14 +60,11 @@ logging.basicConfig(
 )
 log = logging.getLogger("its-helpdesk-bot")
 
-if not ENV_ADMIN_IDS:
-    log.warning("No ADMIN_IDS provided via ENV. You can add admins with /add_admin <id> (for existing admin only).")
-
-# ------------------ CONSTANTS ------------------
+# ------------------ КОНСТАНТЫ ------------------
 
 DB_PATH = "its_helpdesk.sqlite3"
 
-TZ = timezone.utc  # store everything in UTC
+TZ = timezone.utc
 DATE_FMT = "%Y-%m-%d %H:%M"
 
 KIND_REPAIR = "repair"
@@ -72,16 +74,16 @@ STATUS_NEW = "new"
 STATUS_IN_WORK = "in_work"
 STATUS_DONE = "done"
 STATUS_APPROVED = "approved"
-STATUS_REJECTED = "rejected"   # общий "отказ" (механика/админа в зависимости от контекста)
+STATUS_REJECTED = "rejected"   # отказ исполнителя (для ремонта) / отклонена (для покупок)
 STATUS_CANCELED = "canceled"
 
 PRIORITIES = ["low", "normal", "high"]
 
 # user_data keys
-UD_MODE = "mode"  # values: None | "create_repair" | "create_purchase" | "await_reason"
-UD_REASON_CONTEXT = "reason_ctx"  # dict with action, ticket_id
+UD_MODE = "mode"  # None | "create_repair" | "create_purchase" | "await_reason"
+UD_REASON_CONTEXT = "reason_ctx"  # {action, ticket_id}
 
-# ------------------ UTILS ------------------
+# ------------------ УТИЛИТЫ ------------------
 
 def now_utc():
     return datetime.now(tz=TZ)
@@ -128,7 +130,7 @@ def ensure_int(s: str) -> int | None:
     except Exception:
         return None
 
-# ------------------ DB INIT & ROLES ------------------
+# ------------------ БАЗА ДАННЫХ ------------------
 
 async def init_db(app: Application):
     db = await aiosqlite.connect(DB_PATH)
@@ -172,9 +174,10 @@ async def init_db(app: Application):
         """
     )
 
+    # миграции безопасно
     try:
-        async with db.execute("PRAGMA table_info(users);") as cursor:
-            cols = [row[1] async for row in cursor]
+        async with db.execute("PRAGMA table_info(users);") as cur:
+            cols = [row[1] async for row in cur]
         if "last_username" not in cols:
             await db.execute("ALTER TABLE users ADD COLUMN last_username TEXT;")
         if "last_seen" not in cols:
@@ -183,8 +186,8 @@ async def init_db(app: Application):
         log.warning(f"DB migration (users) check failed: {e}")
 
     try:
-        async with db.execute("PRAGMA table_info(tickets);") as cursor:
-            cols = [row[1] async for row in cursor]
+        async with db.execute("PRAGMA table_info(tickets);") as cur:
+            cols = [row[1] async for row in cur]
         if "reason" not in cols:
             await db.execute("ALTER TABLE tickets ADD COLUMN reason TEXT;")
             log.info("DB migration: added 'reason' column to tickets.")
@@ -223,7 +226,7 @@ async def db_lookup_uid_by_username(db, username: str) -> int | None:
     return row[0] if row else None
 
 async def db_list_roles(db):
-    admins = set(ENV_ADMIN_IDS)
+    admins = set(HARD_ADMIN_IDS) | set(ENV_ADMIN_IDS)
     techs = set(ENV_TECH_IDS)
     async with db.execute("SELECT uid, role FROM users") as cur:
         async for uid, role in cur:
@@ -234,7 +237,7 @@ async def db_list_roles(db):
     return sorted(admins), sorted(techs)
 
 async def is_admin(db, uid: int) -> bool:
-    if uid in ENV_ADMIN_IDS:
+    if uid in HARD_ADMIN_IDS or uid in ENV_ADMIN_IDS:
         return True
     async with db.execute("SELECT 1 FROM users WHERE uid=? AND role='admin' LIMIT 1", (uid,)) as cur:
         row = await cur.fetchone()
@@ -247,10 +250,10 @@ async def is_tech(db, uid: int) -> bool:
         row = await cur.fetchone()
     return bool(row)
 
-# ------------------ UI BUILDERS ------------------
+# ------------------ UI ------------------
 
 async def main_menu(db, uid: int):
-    # Admins: full menu (create repair/purchase + admin row)
+    # Админ: полный набор
     if await is_admin(db, uid):
         rows = [
             [KeyboardButton("🛠 Заявка на ремонт"), KeyboardButton("🧾 Мои заявки")],
@@ -258,26 +261,25 @@ async def main_menu(db, uid: int):
             [KeyboardButton("🛒 Покупки"), KeyboardButton("📓 Журнал")],
         ]
         return ReplyKeyboardMarkup(rows, resize_keyboard=True)
-    # Mechanics (non-admin): no creation buttons, only work queue & own tickets
+    # Механик (не админ): без создания
     if await is_tech(db, uid):
         rows = [
             [KeyboardButton("🧾 Мои заявки")],
             [KeyboardButton("🛠 Заявки на ремонт")],
         ]
         return ReplyKeyboardMarkup(rows, resize_keyboard=True)
-    # Regular users: can create repair/purchase and view own tickets
+    # Обычный пользователь
     rows = [
         [KeyboardButton("🛠 Заявка на ремонт"), KeyboardButton("🧾 Мои заявки")],
         [KeyboardButton("🛒 Заявка на покупку")],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
-def ticket_inline_kb(ticket: dict, is_admin_flag: bool, is_tech_flag: bool, me_id: int):
+def ticket_inline_kb(ticket: dict, is_admin_flag: bool, me_id: int):
     kb = []
     if ticket["kind"] == KIND_REPAIR:
         if is_admin_flag:
             kb.append([InlineKeyboardButton("⚡ Приоритет ↑", callback_data=f"prio:{ticket['id']}")])
-        if is_admin_flag:
             kb.append([
                 InlineKeyboardButton("👤 Назначить себе", callback_data=f"assign_self:{ticket['id']}"),
                 InlineKeyboardButton("👥 Назначить механику", callback_data=f"assign_menu:{ticket['id']}"),
@@ -296,7 +298,7 @@ def ticket_inline_kb(ticket: dict, is_admin_flag: bool, is_tech_flag: bool, me_i
             ])
     return InlineKeyboardMarkup(kb) if kb else None
 
-# ------------------ TICKET HELPERS ------------------
+# ------------------ ТИКЕТЫ ------------------
 
 async def create_ticket(db, *, kind: str, chat_id: int, user_id: int, username: str | None, description: str, photo_file_id: str | None):
     now = now_utc().isoformat()
@@ -368,7 +370,7 @@ async def update_ticket(db, ticket_id: int, **fields):
     await db.execute(f"UPDATE tickets SET {cols} WHERE id=?", params)
     await db.commit()
 
-# ------------------ MESSAGES RENDER ------------------
+# ------------------ РЕНДЕР ------------------
 
 def render_ticket_line(t: dict) -> str:
     if t["kind"] == KIND_REPAIR:
@@ -401,35 +403,33 @@ def render_ticket_line(t: dict) -> str:
         reason = f"\nПричина: {t['reason']}" if t["status"] in (STATUS_REJECTED, STATUS_CANCELED) and t.get("reason") else ""
         return f"{icon} #{t['id']} • {stat}\n{t['description']}{times}{reason}"
 
-# ------------------ HANDLERS ------------------
+# ------------------ ХЕНДЛЕРЫ ------------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = context.application.bot_data["db"]
     uid = update.effective_user.id
     await db_seen_user(db, uid, update.effective_user.username)
     kb = await main_menu(db, uid)
-    text = "Привет это робот инженерно технической службы"
-    await update.message.reply_text(text, reply_markup=kb)
+    await update.message.reply_text("Привет! Это бот инженерно-технической службы.", reply_markup=kb)
     context.user_data[UD_MODE] = None
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "Команды и действия:\n\n"
         "Пользователи/Админы:\n"
-        "• 🛠 Заявка на ремонт — создать, можно отправить фото с подписью.\n"
-        "• 🛒 Заявка на покупку — создать запрос на закупку.\n"
+        "• 🛠 Заявка на ремонт — создать (можно фото с подписью).\n"
+        "• 🛒 Заявка на покупку — создать запрос.\n"
         "• 🧾 Мои заявки — список своих заявок.\n\n"
-        "Механики:\n"
-        "• 🛠 Заявки на ремонт — взять в работу ⏱, завершить ✅, отказ 🛑 (с комментарием).\n\n"
+        "Механики (не создают заявки):\n"
+        "• 🛠 Заявки на ремонт — взять ⏱, завершить ✅, отказ 🛑 (с комментарием).\n\n"
         "Админы:\n"
         "• 📓 Журнал — закрытые ремонты за период.\n\n"
         "Команды:\n"
-        "/repairs [status] [page] — список заявок на ремонт. status: new|in_work|done|all.\n"
-        "/me [status] [page] — мои заявки как исполнителя. status: new|in_work|done|all.\n"
+        "/repairs [status] [page] — заявки на ремонт (new|in_work|done|all).\n"
+        "/me [status] [page] — мои заявки как исполнителя.\n"
         "/find <текст|#id> — поиск (админы).\n"
         "/export [week|month] — экспорт CSV (админы).\n"
         "/journal [days] — журнал (админы).\n"
-        "/add_admin <user_id|@username> — добавить админа (админы).\n"
         "/add_tech <user_id|@username> — добавить техника (админы).\n"
         "/roles — показать роли.\n"
         "/whoami — показать твой user_id.\n"
@@ -444,7 +444,7 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db_seen_user(db, uid, update.effective_user.username)
     await update.message.reply_text(f"Твой user_id: {uid}\nusername: @{uname}")
 
-# --- Text buttons ---
+# --- Кнопки ---
 
 async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = context.application.bot_data["db"]
@@ -453,8 +453,9 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
     if text == "🛠 Заявка на ремонт":
+        # Механикам нельзя создавать
         if await is_tech(db, uid) and not await is_admin(db, uid):
-            await update.message.reply_text("Механикам нельзя создавать заявки. Вы можете брать в работу, завершать или отказать с комментарием.")
+            await update.message.reply_text("Механикам нельзя создавать заявки. Доступно: брать в работу, завершать или отказ с комментарием.")
             return
         context.user_data[UD_MODE] = "create_repair"
         await update.message.reply_text("Опиши проблему. Можно прикрепить фото с подписью.")
@@ -485,16 +486,17 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("Нет новых заявок на ремонт.")
                 return
             for t in rows:
-                kb = ticket_inline_kb(t, is_admin_flag=True, is_tech_flag=True, me_id=uid)
+                kb = ticket_inline_kb(t, is_admin_flag=True, me_id=uid)
                 await update.message.reply_text(render_ticket_line(t), reply_markup=kb)
         else:
+            # механику показываем новые без исполнителя и его текущие
             new_rows = await find_tickets(db, kind=KIND_REPAIR, status=STATUS_NEW, unassigned_only=True, limit=20, offset=0)
             in_rows = await find_tickets(db, kind=KIND_REPAIR, status=STATUS_IN_WORK, assignee_id=uid, limit=20, offset=0)
             if not new_rows and not in_rows:
                 await update.message.reply_text("Нет доступных заявок.")
                 return
             for t in (new_rows + in_rows):
-                kb = ticket_inline_kb(t, is_admin_flag=False, is_tech_flag=True, me_id=uid)
+                kb = ticket_inline_kb(t, is_admin_flag=False, me_id=uid)
                 await update.message.reply_text(render_ticket_line(t), reply_markup=kb)
         return
 
@@ -507,7 +509,7 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Нет новых заявок на покупку.")
             return
         for t in rows:
-            kb = ticket_inline_kb(t, is_admin_flag=True, is_tech_flag=True, me_id=uid)
+            kb = ticket_inline_kb(t, is_admin_flag=True, me_id=uid)
             await update.message.reply_text(render_ticket_line(t), reply_markup=kb)
         return
 
@@ -518,17 +520,19 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_journal(update, context)
         return
 
+    # ввод причины по запросу
     if context.user_data.get(UD_MODE) == "await_reason":
         await handle_reason_input(update, context)
         return
 
+    # режим создания
     if context.user_data.get(UD_MODE) in ("create_repair", "create_purchase"):
         await handle_create_from_text(update, context)
         return
 
     await update.message.reply_text("Используй кнопки меню или /help.")
 
-# --- Create flows ---
+# --- Создание заявок ---
 
 async def handle_create_from_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = context.application.bot_data["db"]
@@ -548,7 +552,8 @@ async def handle_create_from_text(update: Update, context: ContextTypes.DEFAULT_
         await notify_admins(context, f"🆕 Новая заявка на ремонт от @{uname or uid}:\n{description}")
         context.user_data[UD_MODE] = None
         return
-    elif mode == "create_purchase":
+
+    if mode == "create_purchase":
         await create_ticket(db, kind=KIND_PURCHASE, chat_id=chat_id, user_id=uid, username=uname, description=description, photo_file_id=None)
         await update.message.reply_text("Заявка на покупку отправлена. Ожидает решения админа.")
         await notify_admins(context, f"🆕 Новая заявка на покупку от @{uname or uid}:\n{description}")
@@ -556,8 +561,9 @@ async def handle_create_from_text(update: Update, context: ContextTypes.DEFAULT_
         return
 
 async def on_photo_with_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # создаём ремонт только если явно в режиме создания
     if context.user_data.get(UD_MODE) != "create_repair":
-        await update.message.reply_text("Чтобы создать заявку с фото, нажми «🛠 Заявка на ремонт», затем пришли фото с подписью.")
+        await update.message.reply_text("Чтобы создать заявку с фото: нажми «🛠 Заявка на ремонт», затем пришли фото с подписью.")
         return
     db = context.application.bot_data["db"]
     uid = update.effective_user.id
@@ -578,7 +584,7 @@ async def on_photo_with_caption(update: Update, context: ContextTypes.DEFAULT_TY
     await notify_admins(context, f"🆕 Новая заявка на ремонт с фото от @{uname or uid}:\n{caption}")
     context.user_data[UD_MODE] = None
 
-# --- Admin search/export/journal ---
+# --- Поиск/Экспорт/Журнал (админ) ---
 
 async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = context.application.bot_data["db"]
@@ -595,7 +601,7 @@ async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Ничего не найдено.")
         return
     for t in rows:
-        kb = ticket_inline_kb(t, is_admin_flag=True, is_tech_flag=True, me_id=uid)
+        kb = ticket_inline_kb(t, is_admin_flag=True, me_id=uid)
         await update.message.reply_text(render_ticket_line(t), reply_markup=kb)
 
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -686,7 +692,7 @@ async def cmd_journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for part in chunk_text(text):
         await update.message.reply_text(part)
 
-# --- Repairs list with filters/pagination ---
+# --- Списки/фильтры ---
 
 async def cmd_repairs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = context.application.bot_data["db"]
@@ -718,7 +724,7 @@ async def cmd_repairs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     for t in rows:
-        kb = ticket_inline_kb(t, is_admin_flag=admin, is_tech_flag=await is_tech(db, uid), me_id=uid)
+        kb = ticket_inline_kb(t, is_admin_flag=admin, me_id=uid)
         await update.message.reply_text(render_ticket_line(t), reply_markup=kb)
 
 async def cmd_me(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -740,29 +746,10 @@ async def cmd_me(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Пока пусто.")
         return
     for t in rows:
-        kb = ticket_inline_kb(t, is_admin_flag=await is_admin(db, uid), is_tech_flag=True, me_id=uid)
+        kb = ticket_inline_kb(t, is_admin_flag=await is_admin(db, uid), me_id=uid)
         await update.message.reply_text(render_ticket_line(t), reply_markup=kb)
 
-# --- Roles management ---
-
-async def cmd_add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    db = context.application.bot_data["db"]
-    uid = update.effective_user.id
-    if not await is_admin(db, uid):
-        await update.message.reply_text("Недостаточно прав.")
-        return
-    if not context.args:
-        await update.message.reply_text("Использование: /add_admin <user_id|@username>")
-        return
-    arg = context.args[0].strip()
-    target = ensure_int(arg)
-    if not target and arg.startswith('@'):
-        target = await db_lookup_uid_by_username(db, arg)
-    if not target:
-        await update.message.reply_text("Укажи числовой user_id или @username (после того, как пользователь написал боту /start).")
-        return
-    await db_add_user_role(db, target, "admin")
-    await update.message.reply_text(f"Пользователь {target} добавлен как admin.")
+# --- Роли ---
 
 async def cmd_add_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = context.application.bot_data["db"]
@@ -771,7 +758,7 @@ async def cmd_add_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Недостаточно прав.")
         return
     if not context.args:
-        await update.message.reply_text("Использование: /add_tech <user_id|@username>")
+        await update.message.reply_text("Использование: /add_tech <user_id|@username>\n(Пользователь должен сначала написать боту /start.)")
         return
     arg = context.args[0].strip()
     target = ensure_int(arg)
@@ -781,7 +768,7 @@ async def cmd_add_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Укажи числовой user_id или @username (после того, как пользователь написал боту /start).")
         return
     await db_add_user_role(db, target, "tech")
-    await update.message.reply_text(f"Пользователь {target} добавлен как tech.")
+    await update.message.reply_text(f"Пользователь {target} добавлен как mechanic (tech).")
 
 async def cmd_roles(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = context.application.bot_data["db"]
@@ -799,13 +786,13 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data or ""
+
     if data.startswith("assign_menu:"):
         if not await is_admin(db, uid):
             await query.edit_message_text("Недостаточно прав.")
             return
         admins, techs = await db_list_roles(db)
-        kb = []
-        row = []
+        kb, row = [], []
         for idx, tech_uid in enumerate(techs, start=1):
             row.append(InlineKeyboardButton(f"{tech_uid}", callback_data=f"assign_to:{tech_uid}"))
             if idx % 3 == 0:
@@ -1010,7 +997,7 @@ async def handle_reason_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     context.user_data[UD_MODE] = None
     context.user_data[UD_REASON_CONTEXT] = None
 
-# --- Helpers ---
+# --- Уведомления ---
 
 async def notify_admins(context: ContextTypes.DEFAULT_TYPE, text: str):
     db = context.application.bot_data["db"]
@@ -1021,7 +1008,7 @@ async def notify_admins(context: ContextTypes.DEFAULT_TYPE, text: str):
         except Exception as e:
             log.debug(f"Notify admin {aid} failed: {e}")
 
-# ------------------ APP BUILD & RUN ------------------
+# ------------------ РЕГИСТРАЦИЯ ------------------
 
 def register_handlers(app: Application):
     app.add_handler(CommandHandler("start", cmd_start))
@@ -1032,14 +1019,12 @@ def register_handlers(app: Application):
     app.add_handler(CommandHandler("journal", cmd_journal))
     app.add_handler(CommandHandler("repairs", cmd_repairs))
     app.add_handler(CommandHandler("me", cmd_me))
-    app.add_handler(CommandHandler("add_admin", cmd_add_admin))
     app.add_handler(CommandHandler("add_tech", cmd_add_tech))
     app.add_handler(CommandHandler("roles", cmd_roles))
 
     app.add_handler(CallbackQueryHandler(cb_handler))
 
     app.add_handler(MessageHandler(filters.PHOTO & filters.Caption(True), on_photo_with_caption))
-
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_button))
 
 async def on_startup(app: Application):
