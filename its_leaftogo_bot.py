@@ -48,6 +48,7 @@ LOCAL_TZ = ZoneInfo("Europe/Moscow")   # Change if needed
 
 # BOT TOKEN
 BOT_TOKEN = None  # fallback to env if None
+ADMIN_IDS = [ 826495316]
 
 # Database file
 DB_PATH = "helpdesk.sqlite3"
