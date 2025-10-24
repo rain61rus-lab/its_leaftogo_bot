@@ -2,33 +2,22 @@
 # Telegram bot for engineering/maintenance helpdesk
 # python-telegram-bot==20.7, aiosqlite
 #
-# Обновления (24.10.2025):
-# 1. Перед описанием поломки пользователь выбирает помещение и срочность:
-#    - 🟢 Плановое (low)
-#    - 🟡 Срочно, простой (normal)
-#    - 🔴 Авария, линия стоит (high)
-#    Приоритет сохраняется в ticket.priority.
+# Обновления (24.10.2025 + доработка с оборудованием):
 #
-# 2. Механик при "✅ Выполнено" теперь НЕ закрывает сразу. Бот просит:
-#    "Пришли фото результата или напиши 'готово'".
-#    После фото/текста заявка уходит в DONE, фиксируется done_at,
-#    и фото результата сохраняется в done_photo_file_id.
+# 1. Пользователь создаёт заявку на ремонт так:
+#    - выбирает помещение
+#    - выбирает оборудование в этом помещении
+#      (или "Другое оборудование…" и вводит руками)
+#    - выбирает срочность (приоритет)
+#    - описывает проблему (можно фото с подписью)
 #
-# 3. Автор заявки получает уведомления:
-#    - когда механик взял в работу;
-#    - когда механик закрыл.
+# 2. В tickets добавлено поле equipment (текст).
 #
-# 4. У механика в карточке ремонта появилась кнопка
-#    "🛒 Требует закупку".
-#    После неё бот спрашивает "Что купить?" и сам создаёт заявку на покупку,
-#    в описании пишет "Запчасть для заявки #ID (место): ...".
+# 3. В карточке заявки теперь показывается и помещение, и оборудование.
 #
-# Плюс все старые фичи:
-# - механики могут создавать ремонт/покупку и видеть свои заявки;
-# - помещение выбирается из быстрых кнопок (цех варки 1 и т.д.);
-# - карточки с фото приходят механикам/админам как фото с подписью;
-# - админ может назначать механику, повышать приоритет;
-# - журнал/экспорт для админов.
+# 4. Всё остальное поведение (уведомления авторам, механикам, админам,
+#    фото "до" и "после", закупка запчастей по заявке и т.д.) сохранено.
+
 
 import os
 import io
@@ -62,17 +51,16 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Укажи BOT_TOKEN в переменных окружения.")
 
-# Запиши сюда свой user_id как админа.
-# Узнать можно через /whoami.
+# Жёстко заданные админы (можно дописать свой ID сюда)
 HARD_ADMIN_IDS = {826495316}
 
+# Админы и техники из переменных окружения
 ENV_ADMIN_IDS = {
     int(x)
     for x in os.getenv("ADMIN_IDS", "").replace(",", " ").split()
     if x.isdigit()
 }
-# ENV_TECH_IDS не обязателен (механику можно выдать роль через /add_tech)
-ENV_TECH_IDS: set[int] = set()
+ENV_TECH_IDS: set[int] = set()  # техников можно будет добавлять командой /add_tech
 
 # ------------------ ЛОГИ ------------------
 
@@ -107,26 +95,31 @@ STATUS_CANCELED = "canceled"
 
 PRIORITIES = ["low", "normal", "high"]  # low=плановое, normal=срочно, high=авария
 
-# user_data keys / состояния диалогов
-# UD_MODE:
+# ------------------ ДИАЛОГОВЫЕ СОСТОЯНИЯ ------------------
+# UD_MODE может быть:
 #   None
-#   "choose_location_repair"   - выбрать помещение
-#   "input_location_repair"    - ввести помещение руками
-#   "choose_priority_repair"   - выбрать срочность
-#   "create_repair"            - написать описание ремонта / отправить фото с подписью
-#   "create_purchase"          - написать заявку на покупку вручную
-#   "await_reason"             - ожидание причины отказа/отмены
-#   "await_done_photo"         - механик закрывает заявку: ждём фото или текст
-#   "await_buy_desc"           - механик запросил закупку по ремонту
+#   "choose_location_repair"    - выбрать помещение
+#   "input_location_repair"     - ввести помещение руками
+#   "choose_equipment"          - выбрать оборудование в помещении
+#   "input_equipment_custom"    - ввести своё оборудование руками
+#   "choose_priority_repair"    - выбрать срочность
+#   "create_repair"             - описать проблему / отправить фото
+#   "create_purchase"           - обычная заявка на покупку
+#   "await_reason"              - ожидание причины отказа/отмены
+#   "await_done_photo"          - механик закрывает заявку: ждём фото или текст
+#   "await_buy_desc"            - механик запросил закупку по ремонту
+
 UD_MODE = "mode"
 
-UD_REASON_CONTEXT = "reason_ctx"     # {action, ticket_id}
-UD_REPAIR_LOC = "repair_location"    # выбранное помещение
+UD_REASON_CONTEXT = "reason_ctx"        # {action, ticket_id}
+UD_REPAIR_LOC = "repair_location"       # выбранное помещение
+UD_REPAIR_EQUIP = "repair_equipment"    # выбранное оборудование или своё
 UD_REPAIR_PRIORITY = "repair_priority"  # low/normal/high
-UD_DONE_CTX = "done_ctx"             # ticket_id для завершения
-UD_BUY_CONTEXT = "buy_ctx"           # {ticket_id} для закупки
+UD_DONE_CTX = "done_ctx"                # ticket_id для завершения
+UD_BUY_CONTEXT = "buy_ctx"              # {ticket_id} для закупки
 
-# быстрый список помещений
+# ------------------ ПОМЕЩЕНИЯ И ОБОРУДОВАНИЕ ------------------
+
 LOCATIONS = [
     "цех варки 1",
     "цех варки 2",
@@ -140,7 +133,70 @@ LOCATIONS = [
 LOC_OTHER = "Другое помещение…"
 LOC_CANCEL = "↩ Отмена"
 
-# ------------------ УТИЛИТЫ ------------------
+EQUIP_OTHER = "Другое оборудование…"
+EQUIP_CANCEL = "↩ Отмена"
+
+# твой список оборудования по каждому помещению
+EQUIPMENT_BY_LOCATION = {
+    "цех варки 1": [
+        "осушитель воздуха",
+        "СБН-500",
+        "СБН-200",
+        "шнековый транспортер",
+        "просеиватель новый",
+        "просеиватель крашеный",
+        "пылесос",
+    ],
+    "цех варки 2": [
+        "обеспыливатель вертикальный",
+        "обеспыливатель горизонтальный",
+        "пылесос",
+    ],
+    "растарочная": [
+        "дозатор 500",
+        "дозатор 2000",
+        "индукционный запайщик",
+        "транспортер",
+    ],
+    "цех фасовки порошка": [
+        "этикеровщик",
+        "принтер",
+        "термотонель",
+    ],
+    "цех фасовки капсул": [
+        "счетная машина",
+        "ручной этикеровщик",
+        "индукционный запайщик",
+        "принтер",
+        "транспортер",
+        "термотонель",
+    ],
+    "цех фасовки полуфабрикатов": [
+        "стик новый",
+        "стик старый",
+        "саше новый",
+        "саше старый",
+    ],
+    "административный отдел": [
+        "директор",
+        "мастера",
+        "технологи",
+        "АХО",
+        "кухня",
+        "уборная",
+        "раздевалка",
+        "лаборатория",
+        "туалет",
+    ],
+    "склад": [
+        "аппарат запайки резки",
+        "термотонель",
+        "ручной запайщик",
+        "рохля",
+    ],
+}
+
+# ------------------ УТИЛИТЫ ВРЕМЕНИ/ТЕКСТА ------------------
 
 def now_local():
     return datetime.now(tz=TZ)
@@ -196,14 +252,15 @@ def ensure_int(s: str) -> int | None:
 # ------------------ БАЗА ДАННЫХ ------------------
 
 async def init_db(app: Application):
+    """
+    Создаём таблицы + делаем миграции.
+    Теперь tickets содержит поле equipment TEXT.
+    """
     db = await aiosqlite.connect(DB_PATH)
     await db.execute("PRAGMA journal_mode=WAL;")
     await db.execute("PRAGMA synchronous=NORMAL;")
 
-    # В таблицу tickets добавлены:
-    # - location TEXT
-    # - reason TEXT
-    # - done_photo_file_id TEXT (фото после ремонта)
+    # tickets: добавлено поле equipment TEXT
     await db.execute(
         """
         CREATE TABLE IF NOT EXISTS tickets (
@@ -220,6 +277,7 @@ async def init_db(app: Application):
             assignee_id INTEGER,
             assignee_name TEXT,
             location TEXT,
+            equipment TEXT,
             reason TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -243,16 +301,22 @@ async def init_db(app: Application):
         """
     )
 
-    # миграции (добавить колонки если их не было)
+    # миграции существующей БД (если бот уже раньше работал)
     try:
         async with db.execute("PRAGMA table_info(tickets);") as cur:
             cols = [row[1] async for row in cur]
+        # reason
         if "reason" not in cols:
             await db.execute("ALTER TABLE tickets ADD COLUMN reason TEXT;")
+        # location
         if "location" not in cols:
             await db.execute("ALTER TABLE tickets ADD COLUMN location TEXT;")
+        # done_photo_file_id
         if "done_photo_file_id" not in cols:
             await db.execute("ALTER TABLE tickets ADD COLUMN done_photo_file_id TEXT;")
+        # equipment (новое поле)
+        if "equipment" not in cols:
+            await db.execute("ALTER TABLE tickets ADD COLUMN equipment TEXT;")
     except Exception as e:
         log.warning(f"DB migration (tickets) check failed: {e}")
 
@@ -331,10 +395,15 @@ async def is_tech(db, uid: int) -> bool:
     ) as cur:
         row = await cur.fetchone()
     return bool(row)
-
-# ------------------ МЕНЮ ------------------
+# ------------------ МЕНЮ ДЛЯ ПОЛЬЗОВАТЕЛЯ ------------------
 
 async def main_menu(db, uid: int):
+    """
+    Генерирует главное меню в зависимости от роли:
+    - обычный пользователь
+    - механик (tech)
+    - админ
+    """
     if await is_admin(db, uid):
         rows = [
             [KeyboardButton("🛠 Заявка на ремонт"), KeyboardButton("🧾 Мои заявки")],
@@ -358,31 +427,64 @@ async def main_menu(db, uid: int):
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
-def ticket_inline_kb(ticket: dict, is_admin_flag: bool, me_id: int):
-    kb = []
-    if ticket["kind"] == "repair":
-        if is_admin_flag:
-            kb.append([
-                InlineKeyboardButton("⚡ Приоритет ↑", callback_data=f"prio:{ticket['id']}")
-            ])
-            kb.append([
-                InlineKeyboardButton("👤 Назначить себе", callback_data=f"assign_self:{ticket['id']}"),
-                InlineKeyboardButton("👥 Назначить механику", callback_data=f"assign_menu:{ticket['id']}"),
-            ])
-        kb.append([InlineKeyboardButton("⏱ В работу", callback_data=f"to_work:{ticket['id']}")])
-        if (ticket.get("assignee_id") == me_id):
-            kb.append([InlineKeyboardButton("✅ Выполнено", callback_data=f"done:{ticket['id']}")])
-            kb.append([InlineKeyboardButton("🛑 Отказ (с комментарием)", callback_data=f"decline:{ticket['id']}")])
-            kb.append([InlineKeyboardButton("🛒 Требует закупку", callback_data=f"need_buy:{ticket['id']}")])
-    elif ticket["kind"] == "purchase":
-        if is_admin_flag:
-            kb.append([
-                InlineKeyboardButton("✅ Одобрить", callback_data=f"approve:{ticket['id']}"),
-                InlineKeyboardButton("🛑 Отклонить (с причиной)", callback_data=f"reject:{ticket['id']}"),
-            ])
-    return InlineKeyboardMarkup(kb) if kb else None
 
-# ------------------ ТИКЕТЫ ------------------
+# ------------------ КЛАВИАТУРЫ ВЫБОРА ------------------
+
+def locations_keyboard():
+    """
+    Клавиатура выбора помещения при создании заявки на ремонт.
+    """
+    rows = []
+    row = []
+    for i, name in enumerate(LOCATIONS, start=1):
+        row.append(KeyboardButton(name))
+        if i % 2 == 0:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([KeyboardButton(LOC_OTHER)])
+    rows.append([KeyboardButton(LOC_CANCEL)])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
+
+
+def equipment_keyboard(location: str):
+    """
+    Клавиатура выбора оборудования ПОСЛЕ выбора помещения.
+    Добавляем список оборудования + "Другое оборудование…" + "↩ Отмена".
+    """
+    eq_list = EQUIPMENT_BY_LOCATION.get(location, [])
+    rows = []
+    row = []
+    for i, eq in enumerate(eq_list, start=1):
+        row.append(KeyboardButton(eq))
+        if i % 2 == 0:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+
+    # спец-кнопки
+    rows.append([KeyboardButton(EQUIP_OTHER)])
+    rows.append([KeyboardButton(EQUIP_CANCEL)])
+
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
+
+
+def priority_keyboard():
+    """
+    После помещения + оборудования спрашиваем срочность/приоритет.
+    """
+    rows = [
+        [KeyboardButton("🟢 Плановое (можно подождать)")],
+        [KeyboardButton("🟡 Срочно, простой")],
+        [KeyboardButton("🔴 Авария, линия стоит")],
+        [KeyboardButton(LOC_CANCEL)],
+    ]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
+
+
+# ------------------ ОПЕРАЦИИ С ТИКЕТАМИ ------------------
 
 async def create_ticket(
     db,
@@ -394,9 +496,14 @@ async def create_ticket(
     description: str,
     photo_file_id: str | None,
     location: str | None = None,
+    equipment: str | None = None,
     priority: str | None = None,
     done_photo_file_id: str | None = None,
 ):
+    """
+    Создаёт новую заявку (ремонт или покупка).
+    Теперь умеет сохранять поле equipment.
+    """
     now = now_local().isoformat()
     pr = priority or "normal"
     await db.execute(
@@ -409,11 +516,12 @@ async def create_ticket(
             done_photo_file_id,
             assignee_id, assignee_name,
             location,
+            equipment,
             reason,
             created_at, updated_at,
             started_at, done_at
         )
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             kind,
@@ -428,6 +536,7 @@ async def create_ticket(
             None,
             None,
             location,
+            equipment,
             None,
             now,
             now,
@@ -436,6 +545,7 @@ async def create_ticket(
         ),
     )
     await db.commit()
+
 
 async def find_tickets(
     db,
@@ -449,9 +559,13 @@ async def find_tickets(
     limit: int = 20,
     offset: int = 0,
 ):
+    """
+    Универсальный поиск тикетов по условиям.
+    """
     sql = (
         "SELECT id, kind, status, priority, chat_id, user_id, username, description, "
-        "photo_file_id, done_photo_file_id, assignee_id, assignee_name, location, reason, "
+        "photo_file_id, done_photo_file_id, assignee_id, assignee_name, "
+        "location, equipment, reason, "
         "created_at, updated_at, started_at, done_at "
         "FROM tickets"
     )
@@ -470,8 +584,8 @@ async def find_tickets(
         if q.startswith("#") and q[1:].isdigit():
             where.append("id=?"); params.append(int(q[1:]))
         else:
-            where.append("(description LIKE ? OR location LIKE ?)")
-            params.extend([f"%{q}%", f"%{q}%"])
+            where.append("(description LIKE ? OR location LIKE ? OR equipment LIKE ?)")
+            params.extend([f"%{q}%", f"%{q}%", f"%{q}%"])
     if where:
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
@@ -494,14 +608,16 @@ async def find_tickets(
                     "assignee_id": row[10],
                     "assignee_name": row[11],
                     "location": row[12],
-                    "reason": row[13],
-                    "created_at": row[14],
-                    "updated_at": row[15],
-                    "started_at": row[16],
-                    "done_at": row[17],
+                    "equipment": row[13],
+                    "reason": row[14],
+                    "created_at": row[15],
+                    "updated_at": row[16],
+                    "started_at": row[17],
+                    "done_at": row[18],
                 }
             )
     return rows
+
 
 async def get_ticket(db, ticket_id: int) -> dict | None:
     async with db.execute(
@@ -512,7 +628,7 @@ async def get_ticket(db, ticket_id: int) -> dict | None:
                photo_file_id,
                done_photo_file_id,
                assignee_id, assignee_name,
-               location, reason,
+               location, equipment, reason,
                created_at, updated_at,
                started_at, done_at
         FROM tickets
@@ -537,14 +653,19 @@ async def get_ticket(db, ticket_id: int) -> dict | None:
         "assignee_id": row[10],
         "assignee_name": row[11],
         "location": row[12],
-        "reason": row[13],
-        "created_at": row[14],
-        "updated_at": row[15],
-        "started_at": row[16],
-        "done_at": row[17],
+        "equipment": row[13],
+        "reason": row[14],
+        "created_at": row[15],
+        "updated_at": row[16],
+        "started_at": row[17],
+        "done_at": row[18],
     }
 
+
 async def update_ticket(db, ticket_id: int, **fields):
+    """
+    Обновить конкретное поле(я) тикета.
+    """
     if not fields:
         return
     fields["updated_at"] = now_local().isoformat()
@@ -553,25 +674,34 @@ async def update_ticket(db, ticket_id: int, **fields):
     await db.execute(f"UPDATE tickets SET {cols} WHERE id=?", params)
     await db.commit()
 
-# ------------------ РЕНДЕР ------------------
+
+# ------------------ РЕНДЕР КАРТОЧКИ ЗАЯВКИ ------------------
 
 def render_ticket_line(t: dict) -> str:
-    if t["kind"] == "repair":
+    """
+    Как заявка выводится людям в чатах.
+    Теперь показывает и помещение (location), и оборудование (equipment).
+    """
+    if t["kind"] == KIND_REPAIR:
         icon = "🛠"
         stat = {
-            "new": "🆕 Новая",
-            "in_work": "⏱ В работе",
-            "done": "✅ Выполнена",
-            "rejected": "🛑 Отказ исполнителя",
-            "canceled": "🗑 Отменена",
+            STATUS_NEW: "🆕 Новая",
+            STATUS_IN_WORK: "⏱ В работе",
+            STATUS_DONE: "✅ Выполнена",
+            STATUS_REJECTED: "🛑 Отказ исполнителя",
+            STATUS_CANCELED: "🗑 Отменена",
         }.get(t["status"], t["status"])
         prio_human = {
             "low": "🟢 плановое",
             "normal": "🟡 срочно",
             "high": "🔴 авария",
         }.get(t["priority"], t["priority"])
+
         assgn = f" • Исполнитель: {t['assignee_name'] or t['assignee_id'] or '—'}"
-        loc = f"\nПомещение: {t.get('location') or '—'}"
+
+        loc_block = f"\nПомещение: {t.get('location') or '—'}"
+        equip_block = f"\nОборудование: {t.get('equipment') or '—'}"
+
         times = f"\nСоздана: {fmt_dt(t['created_at'])}"
         if t["started_at"]:
             times += f" • Взята: {fmt_dt(t['started_at'])}"
@@ -580,39 +710,78 @@ def render_ticket_line(t: dict) -> str:
                 f" • Готово: {fmt_dt(t['done_at'])}"
                 f" • Длит.: {human_duration(t['started_at'], t['done_at'])}"
             )
+
         reason = ""
-        if t["status"] in ("rejected", "canceled") and t.get("reason"):
+        if t["status"] in (STATUS_REJECTED, STATUS_CANCELED) and t.get("reason"):
             reason = f"\nПричина: {t['reason']}"
+
         return (
             f"{icon} #{t['id']} • {stat} • Приоритет: {prio_human}{assgn}\n"
-            f"{t['description']}{loc}{times}{reason}"
+            f"{t['description']}{loc_block}{equip_block}{times}{reason}"
         )
+
+    # Покупка
     else:
         icon = "🛒"
         stat = {
-            "new": "🆕 Новая",
-            "approved": "✅ Одобрена",
-            "rejected": "🛑 Отклонена",
-            "canceled": "🗑 Отменена",
+            STATUS_NEW: "🆕 Новая",
+            STATUS_APPROVED: "✅ Одобрена",
+            STATUS_REJECTED: "🛑 Отклонена",
+            STATUS_CANCELED: "🗑 Отменена",
         }.get(t["status"], t["status"])
+
         times = f"\nСоздана: {fmt_dt(t['created_at'])}"
+
         reason = (
             f"\nПричина: {t['reason']}"
-            if t["status"] in ("rejected", "canceled") and t.get("reason")
+            if t["status"] in (STATUS_REJECTED, STATUS_CANCELED) and t.get("reason")
             else ""
         )
-        return f"{icon} #{t['id']} • {stat}\n{t['description']}{times}{reason}"
 
-# ------------------ ОТПРАВКА КАРТОЧЕК ------------------
+        return (
+            f"{icon} #{t['id']} • {stat}\n"
+            f"{t['description']}{times}{reason}"
+        )
+
+
+# ------------------ INLINE-КНОПКИ ПОД КАРТОЧКОЙ ------------------
+
+def ticket_inline_kb(ticket: dict, is_admin_flag: bool, me_id: int):
+    """
+    Генерация инлайн-кнопок под каждой карточкой заявки.
+    """
+    kb = []
+    if ticket["kind"] == KIND_REPAIR:
+        if is_admin_flag:
+            kb.append([
+                InlineKeyboardButton("⚡ Приоритет ↑", callback_data=f"prio:{ticket['id']}")
+            ])
+            kb.append([
+                InlineKeyboardButton("👤 Назначить себе", callback_data=f"assign_self:{ticket['id']}"),
+                InlineKeyboardButton("👥 Назначить механику", callback_data=f"assign_menu:{ticket['id']}"),
+            ])
+        kb.append([InlineKeyboardButton("⏱ В работу", callback_data=f"to_work:{ticket['id']}")])
+        if (ticket.get("assignee_id") == me_id):
+            kb.append([InlineKeyboardButton("✅ Выполнено", callback_data=f"done:{ticket['id']}")])
+            kb.append([InlineKeyboardButton("🛑 Отказ (с комментарием)", callback_data=f"decline:{ticket['id']}")])
+            kb.append([InlineKeyboardButton("🛒 Требует закупку", callback_data=f"need_buy:{ticket['id']}")])
+    elif ticket["kind"] == KIND_PURCHASE:
+        if is_admin_flag:
+            kb.append([
+                InlineKeyboardButton("✅ Одобрить", callback_data=f"approve:{ticket['id']}"),
+                InlineKeyboardButton("🛑 Отклонить (с причиной)", callback_data=f"reject:{ticket['id']}"),
+            ])
+    return InlineKeyboardMarkup(kb) if kb else None
+# ------------------ ОТПРАВКА / РЕДАКТИРОВАНИЕ КАРТОЧЕК ------------------
 
 async def send_ticket_card(context: ContextTypes.DEFAULT_TYPE, chat_id: int, t: dict, kb: InlineKeyboardMarkup | None):
     """
     Отправляет карточку заявки:
-    - если это ремонт и есть photo_file_id -> отправляем фото как карточку;
-    - иначе просто текст.
+    - если это ремонт и есть фото поломки -> отправляем фото как карточку
+    - иначе просто текстом
     """
     try:
-        if t.get("photo_file_id") and t.get("kind") == "repair":
+        if t.get("photo_file_id") and t.get("kind") == KIND_REPAIR:
             await context.bot.send_photo(
                 chat_id=chat_id,
                 photo=t["photo_file_id"],
@@ -628,10 +797,11 @@ async def send_ticket_card(context: ContextTypes.DEFAULT_TYPE, chat_id: int, t: 
     except Exception as e:
         log.debug(f"send_ticket_card failed: {e}")
 
+
 async def edit_message_text_or_caption(query, new_text: str):
     """
     Если исходное сообщение было фото — правим подпись.
-    Если это был текст — правим текст.
+    Если это был текст — правим сам текст.
     """
     try:
         if getattr(query.message, "photo", None):
@@ -641,32 +811,39 @@ async def edit_message_text_or_caption(query, new_text: str):
     except Exception as e:
         log.debug(f"edit_message_text_or_caption failed: {e}")
 
-# ------------------ ХЕНДЛЕРЫ КОМАНД ------------------
+
+# ------------------ КОМАНДЫ /start /help /whoami ------------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = context.application.bot_data["db"]
     uid = update.effective_user.id
     await db_seen_user(db, uid, update.effective_user.username)
     kb = await main_menu(db, uid)
+
     await update.message.reply_text(
-        "Привет! Это бот инженерно-технической службы.", reply_markup=kb
+        "Привет! Это бот инженерно-технической службы.",
+        reply_markup=kb
     )
+
+    # сбросим состояния
     context.user_data[UD_MODE] = None
     context.user_data[UD_REPAIR_LOC] = None
+    context.user_data[UD_REPAIR_EQUIP] = None
     context.user_data[UD_REPAIR_PRIORITY] = None
     context.user_data[UD_DONE_CTX] = None
     context.user_data[UD_BUY_CONTEXT] = None
 
+
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "Что он умеет:\n\n"
-        "• 🛠 Заявка на ремонт — выбрать помещение, срочность, описать проблему (можно фото).\n"
+        "• 🛠 Заявка на ремонт — выбрать помещение → оборудование → срочность → описать проблему (можно фото).\n"
         "• 🛒 Заявка на покупку — запросить закупку.\n"
         "• 🧾 Мои заявки — все мои заявки (ремонт и покупка).\n"
         "• 🛒 Мои покупки — только мои заявки на покупку.\n"
         "• 🛠 Заявки на ремонт — список для механика / админа.\n"
         "• 🛒 Покупки — новые покупки на одобрение (админ).\n"
-        "• 📓 Журнал — выполненные / в работе (админ).\n\n"
+        "• 📓 Журнал — выполненные / в работе / отказы (админ).\n\n"
         "Механик в карточке ремонта может:\n"
         "• взять в работу,\n"
         "• отметить выполнено (с фото результата),\n"
@@ -686,6 +863,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text)
 
+
 async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db = context.application.bot_data["db"]
     uid = update.effective_user.id
@@ -693,34 +871,18 @@ async def cmd_whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await db_seen_user(db, uid, update.effective_user.username)
     await update.message.reply_text(f"Твой user_id: {uid}\nusername: @{uname}")
 
-# ------------------ КЛАВИАТУРЫ ВВОДА ------------------
 
-def locations_keyboard():
-    rows = []
-    row = []
-    for i, name in enumerate(LOCATIONS, start=1):
-        row.append(KeyboardButton(name))
-        if i % 2 == 0:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    rows.append([KeyboardButton(LOC_OTHER)])
-    rows.append([KeyboardButton(LOC_CANCEL)])
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
-
-def priority_keyboard():
-    rows = [
-        [KeyboardButton("🟢 Плановое (можно подождать)")],
-        [KeyboardButton("🟡 Срочно, простой")],
-        [KeyboardButton("🔴 Авария, линия стоит")],
-        [KeyboardButton(LOC_CANCEL)],
-    ]
-    return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
-
-# ------------------ ОСНОВНАЯ ЛОГИКА ТЕКСТА ------------------
+# ------------------ ОСНОВНОЙ ОБРАБОТЧИК ТЕКСТА ------------------
 
 async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Этот хендлер рулит пошаговым сценарием:
+    - выбираем помещение
+    - выбираем оборудование
+    - выбираем приоритет
+    - описываем проблему
+    а также все кнопки меню ("Мои заявки", "Журнал", и т.д.)
+    """
     db = context.application.bot_data["db"]
     uid = update.effective_user.id
     await db_seen_user(db, uid, update.effective_user.username)
@@ -728,10 +890,11 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text_in = (update.message.text or "").strip()
     mode = context.user_data.get(UD_MODE)
 
-    # ШАГ 1. Создать ремонт -> выбор помещения
+    # === ШАГ 1. СОЗДАТЬ ЗАЯВКУ НА РЕМОНТ → ВЫБОР ПОМЕЩЕНИЯ ===
     if text_in == "🛠 Заявка на ремонт" and mode is None:
         context.user_data[UD_MODE] = "choose_location_repair"
         context.user_data[UD_REPAIR_LOC] = None
+        context.user_data[UD_REPAIR_EQUIP] = None
         context.user_data[UD_REPAIR_PRIORITY] = None
         await update.message.reply_text(
             "Выбери помещение для ремонта:",
@@ -739,64 +902,138 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # выбор помещения
+    # выбор помещения из списка
     if mode == "choose_location_repair":
         if text_in == LOC_CANCEL:
+            # отмена
             context.user_data[UD_MODE] = None
             context.user_data[UD_REPAIR_LOC] = None
+            context.user_data[UD_REPAIR_EQUIP] = None
             context.user_data[UD_REPAIR_PRIORITY] = None
             await update.message.reply_text(
                 "Отмена.",
                 reply_markup=await main_menu(db, uid),
             )
             return
+
         if text_in == LOC_OTHER:
+            # ручной ввод помещения
             context.user_data[UD_MODE] = "input_location_repair"
             await update.message.reply_text(
                 "Введи название помещения текстом:",
                 reply_markup=ReplyKeyboardRemove(),
             )
             return
+
         if text_in in LOCATIONS:
+            # помещение выбрано, теперь спросим оборудование
             context.user_data[UD_REPAIR_LOC] = text_in
-            context.user_data[UD_MODE] = "choose_priority_repair"
+            context.user_data[UD_MODE] = "choose_equipment"
+
             await update.message.reply_text(
-                f"Помещение: {text_in}\n\nВыбери срочность/аварийность:",
-                reply_markup=priority_keyboard(),
+                f"Помещение: {text_in}\n\nВыбери оборудование:",
+                reply_markup=equipment_keyboard(text_in),
             )
             return
+
+        # не распознали ввод
         await update.message.reply_text(
             "Пожалуйста, выбери помещение с клавиатуры или нажми «Другое помещение…».",
         )
         return
 
-    # ручной ввод помещения
+    # ручной ввод помещения (если выбрали "Другое помещение…")
     if mode == "input_location_repair":
-        custom_loc = text_in
-        if not custom_loc or custom_loc in (LOC_CANCEL, LOC_OTHER):
+        manual_loc = text_in
+        if not manual_loc or manual_loc in (LOC_CANCEL, LOC_OTHER):
             await update.message.reply_text(
                 "Введи корректное название помещения или нажми «↩ Отмена».",
             )
             return
-        context.user_data[UD_REPAIR_LOC] = custom_loc
-        context.user_data[UD_MODE] = "choose_priority_repair"
+
+        context.user_data[UD_REPAIR_LOC] = manual_loc
+        context.user_data[UD_MODE] = "choose_equipment"
+
         await update.message.reply_text(
-            f"Помещение: {custom_loc}\n\nВыбери срочность/аварийность:",
-            reply_markup=priority_keyboard(),
+            f"Помещение: {manual_loc}\n\nВыбери оборудование:",
+            reply_markup=equipment_keyboard(manual_loc),
         )
         return
 
-    # выбор приоритета
-    if mode == "choose_priority_repair":
-        if text_in == LOC_CANCEL:
+    # === ШАГ 2. ВЫБОР ОБОРУДОВАНИЯ ===
+    if mode == "choose_equipment":
+        if text_in == EQUIP_CANCEL:
+            # отменяем вообще создание
             context.user_data[UD_MODE] = None
             context.user_data[UD_REPAIR_LOC] = None
+            context.user_data[UD_REPAIR_EQUIP] = None
             context.user_data[UD_REPAIR_PRIORITY] = None
             await update.message.reply_text(
                 "Отмена.",
                 reply_markup=await main_menu(db, uid),
             )
             return
+
+        if text_in == EQUIP_OTHER:
+            # пойдём в ручной ввод оборудования
+            context.user_data[UD_MODE] = "input_equipment_custom"
+            await update.message.reply_text(
+                "Введи оборудование/узел текстом:",
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            return
+
+        # выбрано стандартное оборудование из списка
+        # запоминаем и переходим к приоритету
+        chosen_loc = context.user_data.get(UD_REPAIR_LOC)
+        eq_list = EQUIPMENT_BY_LOCATION.get(chosen_loc, [])
+        if text_in in eq_list:
+            context.user_data[UD_REPAIR_EQUIP] = text_in
+            context.user_data[UD_MODE] = "choose_priority_repair"
+            await update.message.reply_text(
+                f"Оборудование: {text_in}\n\nВыбери срочность/аварийность:",
+                reply_markup=priority_keyboard(),
+            )
+            return
+
+        # не совпало ни с кнопкой, ни с системными — попросим ткнуть правильно
+        await update.message.reply_text(
+            "Выбери оборудование с клавиатуры "
+            "или нажми «Другое оборудование…».",
+        )
+        return
+
+    # Если выбрали "Другое оборудование…" и вводим руками
+    if mode == "input_equipment_custom":
+        manual_equipment = text_in
+        if not manual_equipment or manual_equipment in (EQUIP_OTHER, EQUIP_CANCEL):
+            await update.message.reply_text(
+                "Введи корректное название оборудования или нажми «↩ Отмена».",
+            )
+            return
+
+        context.user_data[UD_REPAIR_EQUIP] = manual_equipment
+        context.user_data[UD_MODE] = "choose_priority_repair"
+
+        await update.message.reply_text(
+            f"Оборудование: {manual_equipment}\n\nВыбери срочность/аварийность:",
+            reply_markup=priority_keyboard(),
+        )
+        return
+
+    # === ШАГ 3. ВЫБОР ПРИОРИТЕТА (срочности) ===
+    if mode == "choose_priority_repair":
+        if text_in == LOC_CANCEL:
+            context.user_data[UD_MODE] = None
+            context.user_data[UD_REPAIR_LOC] = None
+            context.user_data[UD_REPAIR_EQUIP] = None
+            context.user_data[UD_REPAIR_PRIORITY] = None
+            await update.message.reply_text(
+                "Отмена.",
+                reply_markup=await main_menu(db, uid),
+            )
+            return
+
         pr_map = {
             "🟢 Плановое (можно подождать)": "low",
             "🟡 Срочно, простой": "normal",
@@ -806,16 +1043,18 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data[UD_REPAIR_PRIORITY] = pr_map[text_in]
             context.user_data[UD_MODE] = "create_repair"
             await update.message.reply_text(
-                "Опиши проблему. Можно прикрепить фото с подписью.",
+                "Опиши проблему. Можно прикрепить фото с подписью.\n\n"
+                "Важно: текст/подпись станет описанием заявки.",
                 reply_markup=ReplyKeyboardRemove(),
             )
             return
+
         await update.message.reply_text(
             "Выбери один из вариантов срочности или нажми «↩ Отмена».",
         )
         return
 
-    # ШАГ 2. Создать покупку вручную
+    # === ШАГ 4. СОЗДАНИЕ ЗАЯВКИ НА ПОКУПКУ (ручной режим) ===
     if text_in == "🛒 Заявка на покупку" and mode is None:
         context.user_data[UD_MODE] = "create_purchase"
         await update.message.reply_text(
@@ -823,7 +1062,7 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # МОИ ЗАЯВКИ
+    # === МОИ ЗАЯВКИ ===
     if text_in == "🧾 Мои заявки" and mode is None:
         rows = await find_tickets(db, user_id=uid, limit=20, offset=0)
         if not rows:
@@ -833,10 +1072,10 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_ticket_card(context, update.effective_chat.id, t, None)
         return
 
-    # МОИ ПОКУПКИ
+    # === МОИ ПОКУПКИ ===
     if text_in == "🛒 Мои покупки" and mode is None:
         rows = await find_tickets(
-            db, kind="purchase", user_id=uid, limit=20, offset=0
+            db, kind=KIND_PURCHASE, user_id=uid, limit=20, offset=0
         )
         if not rows:
             await update.message.reply_text("Твоих заявок на покупку пока нет.")
@@ -845,12 +1084,12 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await send_ticket_card(context, update.effective_chat.id, t, None)
         return
 
-    # СПИСОК ЗАЯВОК НА РЕМОНТ
+    # === СПИСОК РЕМОНТОВ (для механиков/админов) ===
     if text_in == "🛠 Заявки на ремонт" and mode is None:
         admin = await is_admin(db, uid)
         if admin:
             rows = await find_tickets(
-                db, kind="repair", status="new", limit=20, offset=0
+                db, kind=KIND_REPAIR, status=STATUS_NEW, limit=20, offset=0
             )
             if not rows:
                 await update.message.reply_text("Нет новых заявок на ремонт.")
@@ -863,24 +1102,24 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             new_unassigned = await find_tickets(
                 db,
-                kind="repair",
-                status="new",
+                kind=KIND_REPAIR,
+                status=STATUS_NEW,
                 unassigned_only=True,
                 limit=20,
                 offset=0,
             )
             new_assigned_to_me = await find_tickets(
                 db,
-                kind="repair",
-                status="new",
+                kind=KIND_REPAIR,
+                status=STATUS_NEW,
                 assignee_id=uid,
                 limit=20,
                 offset=0,
             )
             in_rows = await find_tickets(
                 db,
-                kind="repair",
-                status="in_work",
+                kind=KIND_REPAIR,
+                status=STATUS_IN_WORK,
                 assignee_id=uid,
                 limit=20,
                 offset=0,
@@ -896,13 +1135,13 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
         return
 
-    # АДМИН: заявки на покупку
+    # === АДМИН: ПОКУПКИ В ОЖИДАНИИ ===
     if text_in == "🛒 Покупки" and mode is None:
         if not await is_admin(db, uid):
             await update.message.reply_text("Недостаточно прав.")
             return
         rows = await find_tickets(
-            db, kind="purchase", status="new", limit=20, offset=0
+            db, kind=KIND_PURCHASE, status=STATUS_NEW, limit=20, offset=0
         )
         if not rows:
             await update.message.reply_text("Нет новых заявок на покупку.")
@@ -914,7 +1153,7 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         return
 
-    # АДМИН: журнал
+    # === АДМИН: ЖУРНАЛ ===
     if text_in == "📓 Журнал" and mode is None:
         if not await is_admin(db, uid):
             await update.message.reply_text("Недостаточно прав.")
@@ -922,7 +1161,7 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_journal(update, context)
         return
 
-    # ЗАВЕРШЕНИЕ ЗАЯВКИ (механик уже нажал ✅, ждём фото или "готово")
+    # === РЕЖИМ "await_done_photo" (механик закрывает заявку) ===
     if mode == "await_done_photo":
         tid = context.user_data.get(UD_DONE_CTX)
         if not tid:
@@ -936,37 +1175,36 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not t:
             await update.message.reply_text("Заявка не найдена.")
         else:
-            # только исполнитель может финализировать
             if t.get("assignee_id") != uid:
                 await update.message.reply_text(
                     "Закрыть может только исполнитель."
                 )
             else:
-                # финальная фиксация без фото
+                # финализация без фото
                 await update_ticket(
                     db,
                     tid,
-                    status="done",
+                    status=STATUS_DONE,
                     done_at=now_local().isoformat(),
                 )
                 # уведомляем автора
                 try:
                     await context.bot.send_message(
                         chat_id=t["user_id"],
-                        text=(
-                            f"Твоя заявка #{tid} отмечена как выполненная."
-                        ),
+                        text=(f"Твоя заявка #{tid} отмечена как выполненная.")
                     )
                 except Exception as e:
                     log.debug(f"Notify author done (text) failed: {e}")
+
                 await update.message.reply_text(
                     f"Заявка #{tid} закрыта ✅."
                 )
+
         context.user_data[UD_MODE] = None
         context.user_data[UD_DONE_CTX] = None
         return
 
-    # ОЖИДАЕМ ОПИСАНИЕ ЗАКУПКИ после "🛒 Требует закупку"
+    # === РЕЖИМ "await_buy_desc": механик поясняет, что купить по ремонту ===
     if mode == "await_buy_desc":
         buy_ctx = context.user_data.get(UD_BUY_CONTEXT) or {}
         tid = buy_ctx.get("ticket_id")
@@ -977,21 +1215,27 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data[UD_MODE] = None
             context.user_data[UD_BUY_CONTEXT] = None
             return
+
         base_ticket = await get_ticket(db, tid)
         loc = base_ticket.get("location") if base_ticket else "—"
+        equip = base_ticket.get("equipment") if base_ticket else "—"
         uname = update.effective_user.username or ""
         chat_id = update.message.chat_id
-        desc = f"Запчасть для заявки #{tid} ({loc}): {text_in}"
+        desc = (
+            f"Запчасть для заявки #{tid} "
+            f"({loc} / {equip}): {text_in}"
+        )
 
         await create_ticket(
             db,
-            kind="purchase",
+            kind=KIND_PURCHASE,
             chat_id=chat_id,
             user_id=uid,
             username=uname,
             description=desc,
             photo_file_id=None,
             location=None,
+            equipment=None,
         )
         await update.message.reply_text(
             "Заявка на покупку создана и отправлена админу."
@@ -1005,22 +1249,28 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data[UD_BUY_CONTEXT] = None
         return
 
-    # Причина отказа / отмены / reject
+    # === РЕЖИМ "await_reason": причина отказа/отмены ===
     if mode == "await_reason":
         await handle_reason_input(update, context)
         return
 
-    # Создание описания после помещения+приоритета (ремонт) или обычной покупки
+    # === СОЗДАНИЕ ЗАЯВКИ ПОСЛЕ ВЫБОРА ВСЕГО (ремонт / покупка) ===
     if mode in ("create_repair", "create_purchase"):
         await handle_create_from_text(update, context)
         return
 
-    # если ничего не подошло
+    # Ничего не совпало
     await update.message.reply_text("Используй кнопки меню или /help.")
 
-# ------------------ СОЗДАНИЕ ЗАЯВОК (ТЕКСТ/ФОТО) ------------------
+
+# ------------------ СОЗДАНИЕ ЗАЯВОК ИЗ ТЕКСТА/ФОТО ------------------
 
 async def handle_create_from_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Пользователь уже выбрал помещение, оборудование, приоритет,
+    и теперь отправляет текст описания (или текст для покупки).
+    Создаём тикет.
+    """
     db = context.application.bot_data["db"]
     uid = update.effective_user.id
     uname = update.effective_user.username or ""
@@ -1032,11 +1282,14 @@ async def handle_create_from_text(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text("Опиши заявку текстом.")
         return
 
-    # ремонт
+    # РЕМОНТ
     if mode == "create_repair":
         location = context.user_data.get(UD_REPAIR_LOC)
+        equipment = context.user_data.get(UD_REPAIR_EQUIP)
         priority = context.user_data.get(UD_REPAIR_PRIORITY) or "normal"
+
         if not location:
+            # вернём юзера к выбору помещения
             context.user_data[UD_MODE] = "choose_location_repair"
             await update.message.reply_text(
                 "Сначала выбери помещение:",
@@ -1046,41 +1299,48 @@ async def handle_create_from_text(update: Update, context: ContextTypes.DEFAULT_
 
         await create_ticket(
             db,
-            kind="repair",
+            kind=KIND_REPAIR,
             chat_id=chat_id,
             user_id=uid,
             username=uname,
             description=description,
             photo_file_id=None,
             location=location,
+            equipment=equipment,
             priority=priority,
         )
 
         await update.message.reply_text(
-            f"Заявка на ремонт создана.\n"
+            "Заявка на ремонт создана.\n"
             f"Помещение: {location}\n"
+            f"Оборудование: {equipment or '—'}\n"
             f"Срочность сохранена.\n"
-            f"Админы уведомлены."
+            "Админы и механики уведомлены."
         )
-        # админам отправим карточку
-        await notify_admins_ticket(context, uid)
 
+        # уведомления администраторам и механикам
+        await notify_admins_ticket(context, uid)
+        await notify_techs_ticket(context, uid)
+
+        # сброс состояния
         context.user_data[UD_MODE] = None
         context.user_data[UD_REPAIR_LOC] = None
+        context.user_data[UD_REPAIR_EQUIP] = None
         context.user_data[UD_REPAIR_PRIORITY] = None
         return
 
-    # покупка
+    # ПОКУПКА
     if mode == "create_purchase":
         await create_ticket(
             db,
-            kind="purchase",
+            kind=KIND_PURCHASE,
             chat_id=chat_id,
             user_id=uid,
             username=uname,
             description=description,
             photo_file_id=None,
             location=None,
+            equipment=None,
         )
         await update.message.reply_text(
             "Заявка на покупку отправлена. Ожидает решения админа."
@@ -1092,11 +1352,12 @@ async def handle_create_from_text(update: Update, context: ContextTypes.DEFAULT_
         context.user_data[UD_MODE] = None
         return
 
+
 async def on_photo_with_caption(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Обрабатывает:
-    1) Завершение ремонта (await_done_photo): механик прислал фото результата.
-    2) Создание ремонта с фото (create_repair): пользователь прислал фото поломки с подписью.
+    Обрабатывает два случая:
+    1) закрытие заявки (await_done_photo) — механик скидывает фото результата
+    2) создание ремонта с фото поломки (create_repair) — оператор скидывает фото
     """
     db = context.application.bot_data["db"]
     uid = update.effective_user.id
@@ -1104,7 +1365,7 @@ async def on_photo_with_caption(update: Update, context: ContextTypes.DEFAULT_TY
 
     mode = context.user_data.get(UD_MODE)
 
-    # 1) закрытие заявки с фото результата ремонта
+    # 1) механик закрывает заявку фото-отчётом
     if mode == "await_done_photo":
         tid = context.user_data.get(UD_DONE_CTX)
         if not tid:
@@ -1124,14 +1385,13 @@ async def on_photo_with_caption(update: Update, context: ContextTypes.DEFAULT_TY
                     "Закрыть может только исполнитель."
                 )
             else:
-                final_caption = (update.message.caption or "").strip()
                 photo = update.message.photo[-1]
                 file_id = photo.file_id
 
                 await update_ticket(
                     db,
                     tid,
-                    status="done",
+                    status=STATUS_DONE,
                     done_at=now_local().isoformat(),
                     done_photo_file_id=file_id,
                 )
@@ -1140,9 +1400,7 @@ async def on_photo_with_caption(update: Update, context: ContextTypes.DEFAULT_TY
                 try:
                     await context.bot.send_message(
                         chat_id=t["user_id"],
-                        text=(
-                            f"Твоя заявка #{tid} отмечена как выполненная."
-                        ),
+                        text=(f"Твоя заявка #{tid} отмечена как выполненная.")
                     )
                 except Exception as e:
                     log.debug(
@@ -1157,11 +1415,12 @@ async def on_photo_with_caption(update: Update, context: ContextTypes.DEFAULT_TY
         context.user_data[UD_DONE_CTX] = None
         return
 
-    # 2) создание новой ремонтной заявки с фото поломки
+    # 2) создание ремонтной заявки с фото поломки
     if mode != "create_repair":
         await update.message.reply_text(
             "Чтобы создать заявку с фото: нажми «🛠 Заявка на ремонт», "
-            "выбери помещение и срочность, затем пришли фото с подписью."
+            "выбери помещение → оборудование → срочность, "
+            "а потом пришли фото с подписью."
         )
         return
 
@@ -1176,6 +1435,7 @@ async def on_photo_with_caption(update: Update, context: ContextTypes.DEFAULT_TY
         return
 
     location = context.user_data.get(UD_REPAIR_LOC)
+    equipment = context.user_data.get(UD_REPAIR_EQUIP)
     priority = context.user_data.get(UD_REPAIR_PRIORITY) or "normal"
     if not location:
         context.user_data[UD_MODE] = "choose_location_repair"
@@ -1190,32 +1450,42 @@ async def on_photo_with_caption(update: Update, context: ContextTypes.DEFAULT_TY
 
     await create_ticket(
         db,
-        kind="repair",
+        kind=KIND_REPAIR,
         chat_id=chat_id,
         user_id=uid,
         username=uname,
         description=caption,
         photo_file_id=file_id,
         location=location,
+        equipment=equipment,
         priority=priority,
     )
 
     await update.message.reply_text(
-        f"Заявка на ремонт с фото создана.\n"
+        "Заявка на ремонт с фото создана.\n"
         f"Помещение: {location}\n"
+        f"Оборудование: {equipment or '—'}\n"
         f"Срочность сохранена.\n"
-        f"Админы уведомлены."
+        "Админы и механики уведомлены."
     )
 
+    # уведомить админов и механиков
     await notify_admins_ticket(context, uid)
+    await notify_techs_ticket(context, uid)
 
+    # сбросить состояние
     context.user_data[UD_MODE] = None
     context.user_data[UD_REPAIR_LOC] = None
+    context.user_data[UD_REPAIR_EQUIP] = None
     context.user_data[UD_REPAIR_PRIORITY] = None
-
-# ------------------ АДМИН ФУНКЦИИ: ПОИСК / ЭКСПОРТ / ЖУРНАЛ ------------------
+# ------------------ АДМИН-ФУНКЦИИ: ПОИСК / ЭКСПОРТ / ЖУРНАЛ ------------------
 
 async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /find <текст|#id>
+    Только админ.
+    Ищем по описанию / помещению / оборудованию или по номеру #ID.
+    """
     db = context.application.bot_data["db"]
     uid = update.effective_user.id
     if not await is_admin(db, uid):
@@ -1233,14 +1503,18 @@ async def cmd_find(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = ticket_inline_kb(t, is_admin_flag=True, me_id=uid)
         await send_ticket_card(context, update.effective_chat.id, t, kb)
 
+
 async def export_rows(db, start_iso: str):
+    """
+    Получаем заявки за период (неделя / месяц) для CSV экспорта.
+    """
     async with db.execute(
         """
         SELECT
             id, kind, status, priority,
             user_id, username,
             assignee_id, assignee_name,
-            location,
+            location, equipment,
             created_at, started_at, done_at,
             reason, description
         FROM tickets
@@ -1262,27 +1536,36 @@ async def export_rows(db, start_iso: str):
                     "assignee_id": row[6],
                     "assignee_name": row[7],
                     "location": row[8],
-                    "created_at": row[9],
-                    "started_at": row[10],
-                    "done_at": row[11],
-                    "reason": row[12],
-                    "description": row[13],
+                    "equipment": row[9],
+                    "created_at": row[10],
+                    "started_at": row[11],
+                    "done_at": row[12],
+                    "reason": row[13],
+                    "description": row[14],
                 }
             )
     return rows
 
+
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /export [week|month]
+    Только админ. Делает CSV и отправляет файлом.
+    """
     db = context.application.bot_data["db"]
     uid = update.effective_user.id
     if not await is_admin(db, uid):
         await update.message.reply_text("Недостаточно прав.")
         return
+
     period = (context.args[0].lower() if context.args else "week").strip()
     if period not in ("week", "month"):
         await update.message.reply_text("Использование: /export [week|month]")
         return
-    now = now_local()
-    start = now - (timedelta(days=7) if period == "week" else timedelta(days=30))
+
+    now_ = now_local()
+    start = now_ - (timedelta(days=7) if period == "week" else timedelta(days=30))
+
     rows = await export_rows(db, start_iso=start.isoformat())
     if not rows:
         await update.message.reply_text("Нет данных для экспорта.")
@@ -1300,6 +1583,7 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "assignee_id",
         "assignee_name",
         "location",
+        "equipment",
         "created_at",
         "started_at",
         "done_at",
@@ -1307,6 +1591,7 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "reason",
         "description",
     ])
+
     for r in rows:
         dur = human_duration(r["started_at"], r["done_at"])
         writer.writerow([
@@ -1319,13 +1604,15 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
             r["assignee_id"] or "",
             r["assignee_name"] or "",
             r.get("location") or "",
+            r.get("equipment") or "",
             r["created_at"],
             r["started_at"] or "",
             r["done_at"] or "",
             dur,
             r["reason"] or "",
-            r["description"].replace("\n", " ")[:500],
+            (r["description"] or "").replace("\n", " ")[:500],
         ])
+
     data = buf.getvalue().encode("utf-8")
 
     await update.message.reply_document(
@@ -1335,19 +1622,28 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption=f"Экспорт за {period}.",
     )
 
+
 async def cmd_journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /journal [days]
+    Только админ.
+    Журнал статусов (в работе / выполнена / отказ исполнителя) за последние N дней.
+    Теперь выводит помещение и оборудование.
+    """
     db = context.application.bot_data["db"]
     uid = update.effective_user.id
     if not await is_admin(db, uid):
         await update.message.reply_text("Недостаточно прав.")
         return
+
     days = ensure_int(context.args[0]) if context.args else 30
     days = days or 30
     since = now_local() - timedelta(days=days)
-    # показываем ремонтные статусы "в работе", "выполнена", "отказ"
+
     async with db.execute(
         """
-        SELECT id, description, location, assignee_name, assignee_id,
+        SELECT id, description, location, equipment,
+               assignee_name, assignee_id,
                started_at, done_at,
                created_at, updated_at,
                status, reason
@@ -1370,6 +1666,7 @@ async def cmd_journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         id_,
         desc,
         loc,
+        equip,
         aname,
         aid,
         started,
@@ -1379,17 +1676,19 @@ async def cmd_journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status,
         reason,
     ) in items:
+
         who = aname or aid or "—"
         status_text = {
-            "in_work": "⏱ В работе",
-            "done": "✅ Выполнена",
-            "rejected": "🛑 Отказ исполнителя",
+            STATUS_IN_WORK: "⏱ В работе",
+            STATUS_DONE: "✅ Выполнена",
+            STATUS_REJECTED: "🛑 Отказ исполнителя",
         }.get(status, status)
 
         created_s = f"Создана: {fmt_dt(created)}"
         loc_s = f"Помещение: {loc or '—'}"
+        equip_s = f"Оборудование: {equip or '—'}"
 
-        if status == "in_work":
+        if status == STATUS_IN_WORK:
             dur = (
                 human_duration(started, now_local().isoformat())
                 if started
@@ -1397,27 +1696,38 @@ async def cmd_journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             line = (
                 f"#{id_} • {status_text} • Исп.: {who}\n"
-                f"{loc_s}\n"
+                f"{loc_s}\n{equip_s}\n"
                 f"{created_s} • Взята: {fmt_dt(started)} • "
                 f"Длит.: {dur}\n"
                 f"{desc}"
             )
-        elif status == "done":
+
+        elif status == STATUS_DONE:
             dur = human_duration(started, done)
             line = (
                 f"#{id_} • {status_text} • Исп.: {who}\n"
-                f"{loc_s}\n"
+                f"{loc_s}\n{equip_s}\n"
                 f"{created_s} • Взята: {fmt_dt(started)} • "
                 f"Готово: {fmt_dt(done)} • "
                 f"Длит.: {dur}\n"
                 f"{desc}"
             )
-        else:  # rejected
+
+        else:  # отказ исполнителя
+            if started:
+                timing_part = (
+                    f"{created_s} • Взята: {fmt_dt(started)} • "
+                    f"Обновлена: {fmt_dt(updated)}"
+                )
+            else:
+                timing_part = (
+                    f"{created_s} • Обновлена: {fmt_dt(updated)}"
+                )
+
             line = (
                 f"#{id_} • {status_text} • Исп.: {who}\n"
-                f"{loc_s}\n"
-                f"{created_s} • Взята: {fmt_dt(started)} • "
-                f"Обновлена: {fmt_dt(updated)}\n"
+                f"{loc_s}\n{equip_s}\n"
+                f"{timing_part}\n"
                 f"{desc}"
             )
             if reason:
@@ -1429,9 +1739,15 @@ async def cmd_journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for part in chunk_text(text_out):
         await update.message.reply_text(part)
 
-# ------------------ СПИСКИ / ФИЛЬТРЫ ------------------
+
+# ------------------ СПИСКИ / ФИЛЬТРЫ ПО КОМАНДАМ ------------------
 
 async def cmd_repairs(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /repairs [status] [page]
+    status = new|in_work|done|all
+    Показывает ремонтные заявки. Для админа все, для механика — только свои/свободные.
+    """
     db = context.application.bot_data["db"]
     uid = update.effective_user.id
     status_arg = (context.args[0].lower() if context.args else "new").strip()
@@ -1440,60 +1756,60 @@ async def cmd_repairs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     offset = (page - 1) * 20
 
     status_map = {
-        "new": "new",
-        "in_work": "in_work",
-        "done": "done",
+        "new": STATUS_NEW,
+        "in_work": STATUS_IN_WORK,
+        "done": STATUS_DONE,
         "all": None,
     }
-    stat = status_map.get(status_arg, "new")
+    stat = status_map.get(status_arg, STATUS_NEW)
 
     admin = await is_admin(db, uid)
     if admin:
         if stat:
             rows = await find_tickets(
                 db,
-                kind="repair",
+                kind=KIND_REPAIR,
                 status=stat,
                 limit=20,
                 offset=offset,
             )
         else:
             rows = await find_tickets(
-                db, kind="repair", limit=20, offset=offset
+                db, kind=KIND_REPAIR, limit=20, offset=offset
             )
     else:
-        if stat == "new":
+        if stat == STATUS_NEW:
             unassigned = await find_tickets(
                 db,
-                kind="repair",
-                status="new",
+                kind=KIND_REPAIR,
+                status=STATUS_NEW,
                 unassigned_only=True,
                 limit=20,
                 offset=offset,
             )
             assigned_to_me = await find_tickets(
                 db,
-                kind="repair",
-                status="new",
+                kind=KIND_REPAIR,
+                status=STATUS_NEW,
                 assignee_id=uid,
                 limit=20,
                 offset=0,
             )
             rows = assigned_to_me + unassigned
-        elif stat == "in_work":
+        elif stat == STATUS_IN_WORK:
             rows = await find_tickets(
                 db,
-                kind="repair",
-                status="in_work",
+                kind=KIND_REPAIR,
+                status=STATUS_IN_WORK,
                 assignee_id=uid,
                 limit=20,
                 offset=offset,
             )
-        elif stat == "done":
+        elif stat == STATUS_DONE:
             rows = await find_tickets(
                 db,
-                kind="repair",
-                status="done",
+                kind=KIND_REPAIR,
+                status=STATUS_DONE,
                 assignee_id=uid,
                 limit=20,
                 offset=offset,
@@ -1501,24 +1817,24 @@ async def cmd_repairs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif stat is None:  # all
             assigned_new = await find_tickets(
                 db,
-                kind="repair",
-                status="new",
+                kind=KIND_REPAIR,
+                status=STATUS_NEW,
                 assignee_id=uid,
                 limit=20,
                 offset=0,
             )
             in_work = await find_tickets(
                 db,
-                kind="repair",
-                status="in_work",
+                kind=KIND_REPAIR,
+                status=STATUS_IN_WORK,
                 assignee_id=uid,
                 limit=20,
                 offset=0,
             )
             unassigned_new = await find_tickets(
                 db,
-                kind="repair",
-                status="new",
+                kind=KIND_REPAIR,
+                status=STATUS_NEW,
                 unassigned_only=True,
                 limit=20,
                 offset=0,
@@ -1535,7 +1851,12 @@ async def cmd_repairs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = ticket_inline_kb(t, is_admin_flag=admin, me_id=uid)
         await send_ticket_card(context, update.effective_chat.id, t, kb)
 
+
 async def cmd_me(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /me [status] [page]
+    Показывает заявки, где я назначен исполнителем.
+    """
     db = context.application.bot_data["db"]
     uid = update.effective_user.id
     status_arg = (context.args[0].lower() if context.args else "in_work").strip()
@@ -1544,17 +1865,17 @@ async def cmd_me(update: Update, context: ContextTypes.DEFAULT_TYPE):
     offset = (page - 1) * 20
 
     status_map = {
-        "new": "new",
-        "in_work": "in_work",
-        "done": "done",
+        "new": STATUS_NEW,
+        "in_work": STATUS_IN_WORK,
+        "done": STATUS_DONE,
         "all": None,
     }
-    stat = status_map.get(status_arg, "in_work")
+    stat = status_map.get(status_arg, STATUS_IN_WORK)
 
     if stat:
         rows = await find_tickets(
             db,
-            kind="repair",
+            kind=KIND_REPAIR,
             status=stat,
             assignee_id=uid,
             limit=20,
@@ -1563,7 +1884,7 @@ async def cmd_me(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         rows = await find_tickets(
             db,
-            kind="repair",
+            kind=KIND_REPAIR,
             assignee_id=uid,
             limit=20,
             offset=offset,
@@ -1579,7 +1900,12 @@ async def cmd_me(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await send_ticket_card(context, update.effective_chat.id, t, kb)
 
+
 async def cmd_mypurchases(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /mypurchases [page]
+    Показывает мои заявки на покупку.
+    """
     db = context.application.bot_data["db"]
     uid = update.effective_user.id
     page = ensure_int(context.args[0]) if context.args else 1
@@ -1588,7 +1914,7 @@ async def cmd_mypurchases(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     rows = await find_tickets(
         db,
-        kind="purchase",
+        kind=KIND_PURCHASE,
         user_id=uid,
         limit=20,
         offset=offset,
@@ -1599,9 +1925,15 @@ async def cmd_mypurchases(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for t in rows:
         await send_ticket_card(context, update.effective_chat.id, t, None)
 
+
 # ------------------ РОЛИ ------------------
 
 async def cmd_add_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /add_tech <user_id|@username>
+    Только админ.
+    Назначает человеку роль механика.
+    """
     db = context.application.bot_data["db"]
     uid = update.effective_user.id
     if not await is_admin(db, uid):
@@ -1627,7 +1959,12 @@ async def cmd_add_tech(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Пользователь {target} добавлен как mechanic (tech)."
     )
 
+
 async def cmd_roles(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /roles
+    Показывает списки uid админов и механиков.
+    """
     db = context.application.bot_data["db"]
     admins, techs = await db_list_roles(db)
     text = (
@@ -1638,9 +1975,41 @@ async def cmd_roles(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text)
 
-# ------------------ CALLBACK КНОПКИ ------------------
+
+# ------------------ INLINE CALLBACK КНОПКИ ПОД КАРТОЧКАМИ ------------------
+
+def extract_ticket_id_from_message(text: str) -> int | None:
+    """
+    Пытаемся достать номер заявки из текста карточки/подписи:
+    ищем первый '#<число>'.
+    """
+    try:
+        parts = text.split("#", 1)
+        if len(parts) < 2:
+            return None
+        tail = parts[1]
+        num = ""
+        for ch in tail:
+            if ch.isdigit():
+                num += ch
+            else:
+                break
+        return int(num) if num else None
+    except Exception:
+        return None
+
 
 async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обрабатывает нажатия на inline-кнопки:
+    - приоритет вверх
+    - назначить себе / назначить механику
+    - взять в работу
+    - выполнено (ждём фото/текст)
+    - отказ с комментарием
+    - требует закупку
+    - одобрить / отклонить покупку
+    """
     db = context.application.bot_data["db"]
     uid = update.effective_user.id
     uname = update.effective_user.username or ""
@@ -1649,7 +2018,7 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = query.data or ""
 
-    # меню назначения механику
+    # меню выбора конкретного механика
     if data.startswith("assign_menu:"):
         if not await is_admin(db, uid):
             await edit_message_text_or_caption(query, "Недостаточно прав.")
@@ -1686,12 +2055,10 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await is_admin(db, uid):
             await edit_message_text_or_caption(query, "Недостаточно прав.")
             return
-        tid = extract_ticket_id_from_message(query.message.text or "")
+        tid = extract_ticket_id_from_message(query.message.caption or query.message.text or "")
         assignee = ensure_int(data.split(":", 1)[1])
         if not tid or not assignee:
-            await query.answer(
-                "Не удалось определить заявку/пользователя."
-            )
+            await query.answer("Не удалось определить заявку/пользователя.")
             return
         await update_ticket(
             db,
@@ -1701,9 +2068,10 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await edit_message_text_or_caption(
             query,
-            (query.message.text or "") + f"\n\nНазначено: {assignee}",
+            (query.message.caption or query.message.text or "")
+            + f"\n\nНазначено: {assignee}",
         )
-        # отправить механику карточку
+        # отправить механику карточку отдельно в личку
         try:
             t = await get_ticket(db, tid)
             if t:
@@ -1734,7 +2102,7 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         await edit_message_text_or_caption(
             query,
-            (query.message.text or "")
+            (query.message.caption or query.message.text or "")
             + f"\n\nНазначено: @{uname or uid}",
         )
         try:
@@ -1766,7 +2134,8 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update_ticket(db, tid, priority=new)
         await edit_message_text_or_caption(
             query,
-            (query.message.text or "") + f"\n\nПриоритет: {new}",
+            (query.message.caption or query.message.text or "")
+            + f"\n\nПриоритет: {new}",
         )
         return
 
@@ -1775,14 +2144,14 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not tid:
             return
         t = await get_ticket(db, tid)
-        if not t or t["kind"] != "repair":
+        if not t or t["kind"] != KIND_REPAIR:
             await query.answer("Некорректная заявка.")
             return
-        if t["status"] != "new":
+        if t["status"] != STATUS_NEW:
             await query.answer("Заявка уже не новая.")
             return
 
-        # защита: если автор админ, механик-сам не должен брать без назначения
+        # защита: если автор админ, то неадмин не может самовольно забрать без назначения
         author_is_admin = await is_admin(db, t["user_id"])
         if (
             author_is_admin
@@ -1814,15 +2183,17 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update_ticket(
             db,
             tid,
-            status="in_work",
+            status=STATUS_IN_WORK,
             started_at=t["started_at"] or now_iso,
         )
 
         await edit_message_text_or_caption(
-            query, (query.message.text or "") + "\n\nСтатус: ⏱ В работе"
+            query,
+            (query.message.caption or query.message.text or "")
+            + "\n\nСтатус: ⏱ В работе"
         )
 
-        # Уведомляем автора, что взяли в работу
+        # уведомляем автора, что механик взял в работу
         try:
             await context.bot.send_message(
                 chat_id=t["user_id"],
@@ -1841,7 +2212,7 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("done:"):
         tid = ensure_int(data.split(":", 1)[1])
         t = await get_ticket(db, tid)
-        if not t or t["kind"] != "repair":
+        if not t or t["kind"] != KIND_REPAIR:
             await query.answer("Некорректная заявка.")
             return
         # закрывать может только исполнитель
@@ -1857,7 +2228,7 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await edit_message_text_or_caption(
             query,
-            (query.message.text or "")
+            (query.message.caption or query.message.text or "")
             + "\n\nПришли фото результата или напиши 'готово'.",
         )
         return
@@ -1867,7 +2238,7 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not tid:
             return
         t = await get_ticket(db, tid)
-        if not t or t["kind"] != "repair":
+        if not t or t["kind"] != KIND_REPAIR:
             await query.answer("Некорректная заявка.")
             return
         if t.get("assignee_id") != uid:
@@ -1882,7 +2253,7 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         await edit_message_text_or_caption(
             query,
-            (query.message.text or "")
+            (query.message.caption or query.message.text or "")
             + "\n\nНапиши причину отказа сообщением:",
         )
         return
@@ -1890,7 +2261,7 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith("need_buy:"):
         tid = ensure_int(data.split(":", 1)[1])
         t = await get_ticket(db, tid)
-        if not t or t["kind"] != "repair":
+        if not t or t["kind"] != KIND_REPAIR:
             await query.answer("Некорректная заявка.")
             return
         # только исполнитель или админ
@@ -1904,26 +2275,8 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data[UD_BUY_CONTEXT] = {"ticket_id": tid}
         await edit_message_text_or_caption(
             query,
-            (query.message.text or "")
+            (query.message.caption or query.message.text or "")
             + "\n\nЧто нужно закупить? Укажи наименование, количество и причину.",
-        )
-        return
-
-    if data.startswith("cancel:"):
-        # оставлено для совместимости с покупками (админ может отменить)
-        if not await is_admin(db, uid):
-            await edit_message_text_or_caption(query, "Недостаточно прав.")
-            return
-        tid = ensure_int(data.split(":", 1)[1])
-        context.user_data[UD_MODE] = "await_reason"
-        context.user_data[UD_REASON_CONTEXT] = {
-            "action": "cancel",
-            "ticket_id": tid,
-        }
-        await edit_message_text_or_caption(
-            query,
-            (query.message.text or "")
-            + "\n\nНапиши причину отмены сообщением:",
         )
         return
 
@@ -1932,19 +2285,18 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await edit_message_text_or_caption(query, "Недостаточно прав.")
             return
         tid = ensure_int(data.split(":", 1)[1])
-        await update_ticket(db, tid, status="approved")
+        await update_ticket(db, tid, status=STATUS_APPROVED)
         await edit_message_text_or_caption(
             query,
-            (query.message.text or "") + "\n\nСтатус: ✅ Одобрена",
+            (query.message.caption or query.message.text or "")
+            + "\n\nСтатус: ✅ Одобрена",
         )
         t = await get_ticket(db, tid)
         if t:
             try:
                 await context.bot.send_message(
                     chat_id=t["user_id"],
-                    text=(
-                        f"Твоя заявка на покупку #{tid} одобрена."
-                    ),
+                    text=(f"Твоя заявка на покупку #{tid} одобрена.")
                 )
             except Exception as e:
                 log.debug(f"Notify author approve failed: {e}")
@@ -1962,32 +2314,71 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         await edit_message_text_or_caption(
             query,
-            (query.message.text or "")
+            (query.message.caption or query.message.text or "")
             + "\n\nНапиши причину отказа сообщением:",
         )
         return
 
-def extract_ticket_id_from_message(text: str) -> int | None:
-    # используется при assign_to
-    # парсим первый #<число>
-    try:
-        parts = text.split("#", 1)
-        if len(parts) < 2:
-            return None
-        tail = parts[1]
-        num = ""
-        for ch in tail:
-            if ch.isdigit():
-                num += ch
-            else:
-                break
-        return int(num) if num else None
-    except Exception:
-        return None
 
-# ------------------ ДОП. ВВОД ТЕКСТОВОЙ ПРИЧИНЫ ------------------
+# ------------------ УВЕДОМЛЕНИЯ ------------------
+
+async def notify_admins(context: ContextTypes.DEFAULT_TYPE, text: str):
+    """
+    Шлём сообщение всем администраторам.
+    """
+    db = context.application.bot_data["db"]
+    admins, _techs = await db_list_roles(db)
+    for aid in admins:
+        try:
+            await context.bot.send_message(chat_id=aid, text=text)
+        except Exception as e:
+            log.debug(f"notify_admins fail {aid}: {e}")
+
+
+async def notify_admins_ticket(context: ContextTypes.DEFAULT_TYPE, author_uid: int):
+    """
+    Берём самую свежую заявку автора и отсылаем админам полную карточку.
+    """
+    db = context.application.bot_data["db"]
+    rows = await find_tickets(
+        db, user_id=author_uid, limit=1, offset=0
+    )
+    if not rows:
+        return
+    t = rows[0]
+    admins, _techs = await db_list_roles(db)
+    for aid in admins:
+        kb = ticket_inline_kb(t, is_admin_flag=True, me_id=aid)
+        await send_ticket_card(context, aid, t, kb)
+
+
+async def notify_techs_ticket(context: ContextTypes.DEFAULT_TYPE, author_uid: int):
+    """
+    То же самое, но шлём механикам новые заявки на ремонт.
+    Механики видят кнопки как механики (без админских прав).
+    """
+    db = context.application.bot_data["db"]
+    rows = await find_tickets(
+        db, user_id=author_uid, limit=1, offset=0
+    )
+    if not rows:
+        return
+    t = rows[0]
+    _admins, techs = await db_list_roles(db)
+    for tid in techs:
+        kb = ticket_inline_kb(t, is_admin_flag=False, me_id=tid)
+        await send_ticket_card(context, tid, t, kb)
+
+
+# ------------------ ПРИЧИНА ОТКАЗА / ОТМЕНЫ ------------------
 
 async def handle_reason_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Пользователь ввёл причину для:
+    - cancel (отмена админом)
+    - reject (отклонение заявки на покупку)
+    - decline_repair (исполнитель отказался от ремонта)
+    """
     db = context.application.bot_data["db"]
     reason_text = (update.message.text or "").strip()
     if not reason_text:
@@ -2015,96 +2406,85 @@ async def handle_reason_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         context.user_data[UD_REASON_CONTEXT] = None
         return
 
-    # отмена админом
+    # отмена админом /cancel (оставлено на будущее)
     if action == "cancel":
         await update_ticket(
-            db, tid, status="canceled", reason=reason_text
+            db, tid, status=STATUS_CANCELED, reason=reason_text
         )
         await update.message.reply_text(
-            f"Заявка #{tid} отменена.\nПричина: {reason_text}"
+            f"Заявка #{tid} отменена."
         )
-
-    # механик отказался от ремонта
-    elif action == "decline_repair":
-        await update_ticket(
-            db,
-            tid,
-            status="rejected",
-            reason=reason_text,
-        )
-        await update.message.reply_text(
-            f"Заявка #{tid} — отказ исполнителя.\nКомментарий: {reason_text}"
-        )
-        # уведомить автора отказа
-        try:
-            await context.bot.send_message(
-                chat_id=t["user_id"],
-                text=(
-                    f"По заявке #{tid} механик оставил отказ.\n"
-                    f"Комментарий: {reason_text}"
-                ),
-            )
-        except Exception as e:
-            log.debug(
-                f"Notify author decline failed: {e}"
-            )
 
     # отклонение покупки админом
-    else:  # reject
+    elif action == "reject":
         await update_ticket(
-            db,
-            tid,
-            status="rejected",
-            reason=reason_text,
+            db, tid, status=STATUS_REJECTED, reason=reason_text
         )
         await update.message.reply_text(
-            f"Заявка #{tid} отклонена.\nПричина: {reason_text}"
+            f"Заявка #{tid} отклонена."
         )
+        # уведомить автора
         try:
             await context.bot.send_message(
                 chat_id=t["user_id"],
-                text=(
-                    f"Твоя заявка #{tid} отклонена.\n"
-                    f"Причина: {reason_text}"
-                ),
+                text=(f"Твоя заявка #{tid} отклонена: {reason_text}")
             )
         except Exception as e:
-            log.debug(
-                f"Notify author reject failed: {e}"
+            log.debug(f"Notify author reject failed: {e}")
+
+    # отказ исполнителя от ремонта
+    elif action == "decline_repair":
+        # только исполнитель имеет право отказываться (проверим)
+        uid = update.effective_user.id
+        if t.get("assignee_id") != uid:
+            await update.message.reply_text(
+                "Отказ может оформить только исполнитель."
             )
+        else:
+            await update_ticket(
+                db,
+                tid,
+                status=STATUS_REJECTED,
+                reason=reason_text,
+            )
+            await update.message.reply_text(
+                f"Заявка #{tid} помечена как отказ исполнителя."
+            )
+            # уведомим автора заявки
+            try:
+                await context.bot.send_message(
+                    chat_id=t["user_id"],
+                    text=(
+                        f"По твоей заявке #{tid} исполнитель отказался:\n"
+                        f"{reason_text}"
+                    ),
+                )
+            except Exception as e:
+                log.debug(
+                    f"Notify author decline_repair failed: {e}"
+                )
 
     context.user_data[UD_MODE] = None
     context.user_data[UD_REASON_CONTEXT] = None
+# ------------------ РЕГИСТРАЦИЯ ХЕНДЛЕРОВ И ЗАПУСК БОТА ------------------
 
-# ------------------ УВЕДОМЛЕНИЯ АДМИНАМ ------------------
-
-async def notify_admins(context: ContextTypes.DEFAULT_TYPE, text: str):
-    db = context.application.bot_data["db"]
-    admins, _ = await db_list_roles(db)
-    for aid in admins:
-        try:
-            await context.bot.send_message(chat_id=aid, text=text)
-        except Exception as e:
-            log.debug(f"Notify admin {aid} failed: {e}")
-
-async def notify_admins_ticket(context: ContextTypes.DEFAULT_TYPE, author_uid: int):
+async def on_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    Берём последнюю заявку автора и кидаем карточку всем админам,
-    с фото если есть.
+    Ловим всё, что не перехватили остальные хендлеры.
+    Это просто чтобы юзер не зависал в тишине.
     """
-    db = context.application.bot_data["db"]
-    rows = await find_tickets(db, user_id=author_uid, limit=1, offset=0)
-    if not rows:
-        return
-    t = rows[0]
-    admins, _ = await db_list_roles(db)
-    kb = ticket_inline_kb(t, is_admin_flag=True, me_id=0)
-    for aid in admins:
-        await send_ticket_card(context, aid, t, kb)
+    await update.message.reply_text(
+        "Я не понял команду. Используй кнопки меню или /help."
+    )
 
-# ------------------ РЕГИСТРАЦИЯ / MAIN ------------------
 
-def register_handlers(app: Application):
+def build_application() -> Application:
+    """
+    Создаём Application, регистрируем все хендлеры.
+    """
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # командные хендлеры
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("whoami", cmd_whoami))
@@ -2120,27 +2500,65 @@ def register_handlers(app: Application):
     app.add_handler(CommandHandler("add_tech", cmd_add_tech))
     app.add_handler(CommandHandler("roles", cmd_roles))
 
+    # inline-кнопки под карточками заявок
     app.add_handler(CallbackQueryHandler(cb_handler))
 
-    # Фото с подписью: или создаём заявку на ремонт, или закрываем ремонт с фото "после"
-    app.add_handler(MessageHandler(filters.PHOTO & filters.Caption(True), on_photo_with_caption))
-    # Любой обычный текст (кнопки, описание заявок, причины и т.д.)
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text_button))
+    # получение фото с подписью (РАЗРЕШЕНО в любом чате)
+    app.add_handler(
+        MessageHandler(
+            filters.PHOTO & (~filters.COMMAND),
+            on_photo_with_caption,
+        )
+    )
+
+    # любые текстовые сообщения и кнопки ReplyKeyboardMarkup
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & (~filters.COMMAND),
+            on_text_button,
+        )
+    )
+
+    # неизвестная команда
+    app.add_handler(
+        MessageHandler(
+            filters.COMMAND,
+            on_unknown,
+        )
+    )
+
+    return app
+
 
 async def on_startup(app: Application):
+    """
+    Будет вызвано при запуске .run_polling()
+    Создаём/мигрируем БД и открываем соединение.
+    """
     await init_db(app)
-    log.info("ITS bot running...")
+    log.info("DB initialized")
+
 
 async def on_shutdown(app: Application):
+    """
+    Закрываем БД, когда бот останавливается.
+    """
     await db_close(app)
-    log.info("ITS bot stopped.")
+    log.info("DB closed")
+
 
 def main():
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
-    register_handlers(application)
-    application.post_init = on_startup
-    application.post_shutdown = on_shutdown
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    """
+    Точка входа.
+    Запускает бота в режиме polling.
+    """
+    app = build_application()
+    app.post_init.append(on_startup)
+    app.post_shutdown.append(on_shutdown)
+
+    log.info("Starting bot polling...")
+    app.run_polling(close_loop=False)
+
 
 if __name__ == "__main__":
     main()
