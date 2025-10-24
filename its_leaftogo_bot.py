@@ -1,19 +1,15 @@
-
 # its_helpdesk_bot.py
 # Telegram bot for IT/Engineering service desk
 # Requires: python-telegram-bot==20.7, aiosqlite
 # Run: BOT_TOKEN=... python its_helpdesk_bot.py
 #
-# ИЗМЕНЕНИЯ ПО ЗАПРОСУ (2025-10-23):
-# 1) Время переведено на московское (MSK, UTC+3).
-# 2) Закрыть заявку (✅ Выполнено) может ТОЛЬКО тот механик, который взял её в работу.
-#    Админ закрывать не может.
-# 3) Заявка остаётся активной до «выполнена» или «отказ исполнителя» — убрана кнопка
-#    «Отмена (с причиной)» для ремонтных заявок.
-# 4) Заявки, созданные админами, распределяет админ: механик не может самовольно взять
-#    в работу такие заявки до назначения админом.
-# 5) Журнал теперь показывает ВСЕ ремонтные заявки со статусами: «в работе», «выполнена», «отказ»
-#    за выбранный период.
+# ИЗМЕНЕНИЯ (2025-10-24):
+# A) Механики теперь МОГУТ создавать заявки на ремонт и покупку (как обычные пользователи).
+# B) Механики видят "NEW, назначенные им" + свои "IN_WORK" + "NEW без исполнителя".
+# C) Команда /repairs для механиков показывает также назначенные им NEW; для all — объединяет разумно.
+# D) При назначении админом заявка отправляется механику полной карточкой с кнопками.
+# E) /help обновлён под новую роль механов.
+# F) Все ранее внесённые изменения (MSK, закрывать может только исполнитель, нет отмены для ремонтов и т.п.) сохранены.
 #
 # ВАЖНО: Впиши свой Telegram user_id в HARD_ADMIN_IDS ниже (после /whoami).
 # Админ добавляет механиков командой /add_tech <user_id|@username>.
@@ -49,7 +45,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set. Задай BOT_TOKEN в Secrets.")
 
-# Впиши здесь СВОЙ user_id. Узнать командой /whoami, затем замени 123456789 на свой ID.
+# Впиши здесь СВОЙ user_id. Узнать командой /whoami, затем замени 826495316 на свой ID при необходимости.
 HARD_ADMIN_IDS = {826495316}
 
 # Можно также указать через ENV (необязательно). Итоговый список админов = HARD_ADMIN_IDS ∪ ENV_ADMIN_IDS.
@@ -283,11 +279,11 @@ async def main_menu(db, uid: int):
             [KeyboardButton("🛒 Покупки"), KeyboardButton("📓 Журнал")],
         ]
         return ReplyKeyboardMarkup(rows, resize_keyboard=True)
-    # Механик (не админ): без создания
+    # Механик (не админ): теперь тоже может создавать заявки
     if await is_tech(db, uid):
         rows = [
-            [KeyboardButton("🧾 Мои заявки")],
-            [KeyboardButton("🛠 Заявки на ремонт")],
+            [KeyboardButton("🛠 Заявка на ремонт"), KeyboardButton("🧾 Мои заявки")],
+            [KeyboardButton("🛒 Заявка на покупку"), KeyboardButton("🛠 Заявки на ремонт")],
         ]
         return ReplyKeyboardMarkup(rows, resize_keyboard=True)
     # Обычный пользователь
@@ -440,13 +436,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "Команды и действия:\n\n"
-        "Пользователи/Админы:\n"
+        "Пользователи/Механики/Админы:\n"
         "• 🛠 Заявка на ремонт — создать (можно фото с подписью).\n"
         "• 🛒 Заявка на покупку — создать запрос.\n"
         "• 🧾 Мои заявки — список своих заявок.\n\n"
-        "Механики (не создают заявки):\n"
-        "• 🛠 Заявки на ремонт — взять ⏱ (кроме заявок, созданных админом до назначения), завершить ✅ (только исполнитель), отказ 🛑 (с комментарием).\n\n"
+        "Механики:\n"
+        "• 🛠 Заявки на ремонт — взять ⏱ (кроме заявок админа до назначения), завершить ✅ (только исполнитель), отказ 🛑 (с комментарием).\n\n"
         "Админы:\n"
+        "• 🛒 Покупки — обработать заявки на покупку (одобрить/отклонить).\n"
         "• 📓 Журнал — выполненные, в работе и в отказе.\n\n"
         "Команды:\n"
         "/repairs [status] [page] — заявки на ремонт (new|in_work|done|all).\n"
@@ -477,18 +474,13 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (update.message.text or "").strip()
 
     if text == "🛠 Заявка на ремонт":
-        # Механикам нельзя создавать
-        if await is_tech(db, uid) and not await is_admin(db, uid):
-            await update.message.reply_text("Механикам нельзя создавать заявки. Доступно: брать в работу (кроме заявок админа до назначения), завершать или отказ с комментарием.")
-            return
+        # Механики теперь тоже могут создавать
         context.user_data[UD_MODE] = "create_repair"
         await update.message.reply_text("Опиши проблему. Можно прикрепить фото с подписью.")
         return
 
     if text == "🛒 Заявка на покупку":
-        if await is_tech(db, uid) and not await is_admin(db, uid):
-            await update.message.reply_text("Механикам нельзя создавать заявки на покупку.")
-            return
+        # Механики теперь тоже могут создавать
         context.user_data[UD_MODE] = "create_purchase"
         await update.message.reply_text("Опиши, что нужно купить (наименование, количество, почему).")
         return
@@ -513,13 +505,21 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 kb = ticket_inline_kb(t, is_admin_flag=True, me_id=uid)
                 await update.message.reply_text(render_ticket_line(t), reply_markup=kb)
         else:
-            # механику: новые без исполнителя и его текущие
-            new_rows = await find_tickets(db, kind=KIND_REPAIR, status=STATUS_NEW, unassigned_only=True, limit=20, offset=0)
-            in_rows = await find_tickets(db, kind=KIND_REPAIR, status=STATUS_IN_WORK, assignee_id=uid, limit=20, offset=0)
-            if not new_rows and not in_rows:
+            # механику: новые без исполнителя + новые, назначенные ему + его текущие
+            new_unassigned = await find_tickets(
+                db, kind=KIND_REPAIR, status=STATUS_NEW, unassigned_only=True, limit=20, offset=0
+            )
+            new_assigned_to_me = await find_tickets(
+                db, kind=KIND_REPAIR, status=STATUS_NEW, assignee_id=uid, limit=20, offset=0
+            )
+            in_rows = await find_tickets(
+                db, kind=KIND_REPAIR, status=STATUS_IN_WORK, assignee_id=uid, limit=20, offset=0
+            )
+            rows = new_assigned_to_me + in_rows + new_unassigned
+            if not rows:
                 await update.message.reply_text("Нет доступных заявок.")
                 return
-            for t in (new_rows + in_rows):
+            for t in rows:
                 kb = ticket_inline_kb(t, is_admin_flag=False, me_id=uid)
                 await update.message.reply_text(render_ticket_line(t), reply_markup=kb)
         return
@@ -748,12 +748,19 @@ async def cmd_repairs(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows = await find_tickets(db, kind=KIND_REPAIR, status=stat, limit=20, offset=offset) if stat else \
                await find_tickets(db, kind=KIND_REPAIR, limit=20, offset=offset)
     else:
-        if stat == STATUS_NEW or stat is None:
-            rows = await find_tickets(db, kind=KIND_REPAIR, status=STATUS_NEW, unassigned_only=True, limit=20, offset=offset)
+        if stat == STATUS_NEW:
+            unassigned = await find_tickets(db, kind=KIND_REPAIR, status=STATUS_NEW, unassigned_only=True, limit=20, offset=offset)
+            assigned_to_me = await find_tickets(db, kind=KIND_REPAIR, status=STATUS_NEW, assignee_id=uid, limit=20, offset=0)
+            rows = assigned_to_me + unassigned
         elif stat == STATUS_IN_WORK:
             rows = await find_tickets(db, kind=KIND_REPAIR, status=STATUS_IN_WORK, assignee_id=uid, limit=20, offset=offset)
         elif stat == STATUS_DONE:
             rows = await find_tickets(db, kind=KIND_REPAIR, status=STATUS_DONE, assignee_id=uid, limit=20, offset=offset)
+        elif stat is None:  # all
+            assigned_new = await find_tickets(db, kind=KIND_REPAIR, status=STATUS_NEW, assignee_id=uid, limit=20, offset=0)
+            in_work = await find_tickets(db, kind=KIND_REPAIR, status=STATUS_IN_WORK, assignee_id=uid, limit=20, offset=0)
+            unassigned_new = await find_tickets(db, kind=KIND_REPAIR, status=STATUS_NEW, unassigned_only=True, limit=20, offset=0)
+            rows = assigned_new + in_work + unassigned_new
         else:
             rows = []
 
@@ -855,11 +862,20 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Не удалось определить заявку/пользователя.")
             return
         await update_ticket(db, tid, assignee_id=assignee, assignee_name=str(assignee))
+        # Обновляем карточку в чате админа
         await query.edit_message_text((query.message.text or "") + f"\n\nНазначено: {assignee}")
+        # Отправляем механику ПОЛНУЮ карточку с кнопками
         try:
-            await context.bot.send_message(chat_id=assignee, text=f"Вам назначена заявка #{tid}.")
+            t = await get_ticket(db, tid)
+            if t:
+                kb_for_tech = ticket_inline_kb(t, is_admin_flag=False, me_id=assignee)
+                await context.bot.send_message(
+                    chat_id=assignee,
+                    text=render_ticket_line(t),
+                    reply_markup=kb_for_tech
+                )
         except Exception as e:
-            log.debug(f"Notify assignee {assignee} failed: {e}")
+            log.debug(f"Notify assignee {assignee} with card failed: {e}")
         return
 
     if data.startswith("assign_self:"):
@@ -871,6 +887,18 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await update_ticket(db, tid, assignee_id=uid, assignee_name=f"@{uname or uid}")
         await query.edit_message_text((query.message.text or "") + f"\n\nНазначено: @{uname or uid}")
+        # Отправляем себе карточку с кнопками
+        try:
+            t = await get_ticket(db, tid)
+            if t:
+                kb_for_me = ticket_inline_kb(t, is_admin_flag=False, me_id=uid)
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=render_ticket_line(t),
+                    reply_markup=kb_for_me
+                )
+        except Exception as e:
+            log.debug(f"Notify self with card failed: {e}")
         return
 
     if data.startswith("prio:"):
@@ -940,7 +968,7 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not t or t["kind"] != KIND_REPAIR:
             await query.answer("Некорректная заявка.")
             return
-        # Отказ тоже только исполнитель (или админ, если захочет, но по ТЗ — оставим только исполнителя)
+        # Отказ тоже только исполнитель
         if t.get("assignee_id") != uid:
             await query.answer("Только исполнитель может отказать по заявке.")
             return
