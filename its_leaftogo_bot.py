@@ -139,9 +139,11 @@ LOCATIONS = [
 
 LOC_OTHER = "Другое помещение…"
 LOC_CANCEL = "↩ Отмена"
+LOC_BACK = "◀️ Назад"
 
 EQUIP_OTHER = "Другое оборудование…"
 EQUIP_CANCEL = "↩ Отмена"
+EQUIP_BACK = "◀️ Назад"
 
 # Оборудование/зона ответственности по каждому помещению (из твоего списка)
 EQUIPMENT_BY_LOCATION = {
@@ -344,6 +346,8 @@ async def init_db(app: Application):
             await db.execute("ALTER TABLE users ADD COLUMN last_username TEXT;")
         if "last_seen" not in cols:
             await db.execute("ALTER TABLE users ADD COLUMN last_seen TEXT;")
+        if "display_name" not in cols:
+            await db.execute("ALTER TABLE users ADD COLUMN display_name TEXT;")
     except Exception as e:
         log.warning(f"DB migration (users) check failed: {e}")
 
@@ -384,6 +388,76 @@ async def db_add_user_role(db, uid: int, role: str):
         (uid, role),
     )
     await db.commit()
+
+
+async def db_remove_user_role(db, uid: int):
+    """
+    Удалить роль пользователя (убрать из механиков/админов).
+    """
+    await db.execute(
+        "DELETE FROM users WHERE uid=?",
+        (uid,),
+    )
+    await db.commit()
+
+
+async def db_set_display_name(db, uid: int, display_name: str):
+    """
+    Установить отображаемое имя для механика.
+    """
+    await db.execute(
+        "INSERT INTO users(uid, display_name) VALUES(?, ?) "
+        "ON CONFLICT(uid) DO UPDATE SET display_name=excluded.display_name",
+        (uid, display_name),
+    )
+    await db.commit()
+
+
+async def db_get_display_name(db, uid: int) -> str | None:
+    """
+    Получить отображаемое имя механика из базы данных.
+    Возвращает None если не задано.
+    """
+    async with db.execute(
+        "SELECT display_name FROM users WHERE uid=? LIMIT 1",
+        (uid,),
+    ) as cur:
+        row = await cur.fetchone()
+    return row[0] if row and row[0] else None
+
+
+async def db_get_username(db, uid: int) -> str | None:
+    """
+    Получить последний известный username пользователя из базы.
+    """
+    async with db.execute(
+        "SELECT last_username FROM users WHERE uid=? LIMIT 1",
+        (uid,),
+    ) as cur:
+        row = await cur.fetchone()
+    return row[0] if row and row[0] else None
+
+
+async def get_mechanic_display_name(db, uid: int, username: str | None = None) -> str:
+    """
+    Получить отображаемое имя механика.
+    Приоритет: display_name > @username > user_id
+    Если username не передан, пытается получить из базы данных.
+    """
+    # Сначала пытаемся получить display_name из базы
+    display_name = await db_get_display_name(db, uid)
+    if display_name:
+        return display_name
+    
+    # Если нет display_name, пытаемся использовать username
+    if not username:
+        username = await db_get_username(db, uid)
+    
+    if username:
+        return f"@{username}" if not username.startswith("@") else username
+    
+    # В крайнем случае возвращаем user_id
+    return str(uid)
 
 
 async def db_lookup_uid_by_username(db, username: str) -> int | None:
@@ -458,20 +532,19 @@ async def main_menu(db, uid: int):
             [KeyboardButton("🛒 Заявка на покупку"), KeyboardButton("🛒 Мои покупки")],
             [KeyboardButton("🛠 Заявки на ремонт")],
             [KeyboardButton("🛒 Покупки"), KeyboardButton("📓 Журнал")],
+            [KeyboardButton("📊 Аналитика"), KeyboardButton("👥 Управление")],
         ]
         return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
     if await is_tech(db, uid):
         rows = [
-            [KeyboardButton("🛠 Заявка на ремонт"), KeyboardButton("🧾 Мои заявки")],
-            [KeyboardButton("🛒 Заявка на покупку"), KeyboardButton("🛒 Мои покупки")],
             [KeyboardButton("🛠 Заявки на ремонт")],
+            [KeyboardButton("🛒 Заявка на покупку"), KeyboardButton("🛒 Мои покупки")],
         ]
         return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
     rows = [
-        [KeyboardButton("🛠 Заявка на ремонт"), KeyboardButton("🧾 Мои заявки")],
-        [KeyboardButton("🛒 Заявка на покупку"), KeyboardButton("🛒 Мои покупки")],
+        [KeyboardButton("🛠 Заявка на ремонт"), KeyboardButton("🧾 Мои заявки на ремонт")],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
@@ -499,7 +572,7 @@ def locations_keyboard():
 def equipment_keyboard(location: str):
     """
     Клавиатура выбора оборудования после помещения.
-    Добавляем список + "Другое оборудование…" + "↩ Отмена".
+    Добавляем список + "Другое оборудование…" + "◀️ Назад" + "↩ Отмена".
     """
     eq_list = EQUIPMENT_BY_LOCATION.get(location, [])
     rows = []
@@ -513,7 +586,7 @@ def equipment_keyboard(location: str):
         rows.append(row)
 
     rows.append([KeyboardButton(EQUIP_OTHER)])
-    rows.append([KeyboardButton(EQUIP_CANCEL)])
+    rows.append([KeyboardButton(EQUIP_BACK), KeyboardButton(EQUIP_CANCEL)])
 
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
 
@@ -525,10 +598,19 @@ def priority_keyboard():
     rows = [
         [KeyboardButton("🟢 Плановое (можно подождать)")],
         [KeyboardButton("🟡 Срочно, простой")],
-        [KeyboardButton("🔴 Авария, линия стоит")],
-        [KeyboardButton(LOC_CANCEL)],
+        [KeyboardButton(LOC_BACK), KeyboardButton(LOC_CANCEL)],
     ]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True, one_time_keyboard=True)
+
+
+def cancel_keyboard():
+    """
+    Простая клавиатура с кнопкой отмены для ручного ввода.
+    """
+    rows = [
+        [KeyboardButton(LOC_CANCEL)],
+    ]
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
 # ======================
@@ -651,7 +733,7 @@ async def find_tickets(
     if where:
         sql += " WHERE " + " AND ".join(where)
 
-    sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
+    sql += " ORDER BY id ASC LIMIT ? OFFSET ?"
     params.extend([limit, offset])
 
     rows = []
@@ -735,6 +817,17 @@ async def update_ticket(db, ticket_id: int, **fields):
     """
     if not fields:
         return
+
+    ALLOWED_COLUMNS = {
+        "kind", "status", "priority", "chat_id", "user_id", "username",
+        "description", "photo_file_id", "done_photo_file_id", "assignee_id",
+        "assignee_name", "location", "equipment", "reason", "created_at",
+        "updated_at", "started_at", "done_at"
+    }
+    
+    for key in fields.keys():
+        if key not in ALLOWED_COLUMNS:
+            raise ValueError(f"Invalid column name: {key}")
 
     fields["updated_at"] = now_local().isoformat()
     cols = ", ".join([f"{k}=?" for k in fields.keys()])
@@ -838,7 +931,8 @@ def ticket_inline_kb(ticket: dict, is_admin_flag: bool, me_id: int):
             InlineKeyboardButton("⏱ В работу", callback_data=f"to_work:{ticket['id']}")
         ])
 
-        if ticket.get("assignee_id") == me_id:
+        # Кнопки управления показываем исполнителю или администратору
+        if ticket.get("assignee_id") == me_id or is_admin_flag:
             kb.append([
                 InlineKeyboardButton("✅ Выполнено", callback_data=f"done:{ticket['id']}")
             ])
@@ -929,12 +1023,15 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "Что я умею:\n\n"
         "• 🛠 Заявка на ремонт — выбери помещение → оборудование → срочность → опиши проблему (можно с фото).\n"
+        "• 🧾 Мои заявки на ремонт — твои заявки на ремонт.\n"
+        "\nДля механиков и администраторов:\n"
         "• 🛒 Заявка на покупку — запрос на закупку.\n"
-        "• 🧾 Мои заявки — твои заявки (ремонт и покупка).\n"
         "• 🛒 Мои покупки — только заявки на покупку.\n"
         "• 🛠 Заявки на ремонт — список для механика/админа.\n"
         "• 🛒 Покупки — новые заявки на покупку для одобрения (админ).\n"
-        "• 📓 Журнал — выполнено / в работе / отказы (админ).\n\n"
+        "• 📓 Журнал — выполнено / в работе / отказы (админ).\n"
+        "• 📊 Аналитика — статистика по заявкам (админ).\n"
+        "• 👥 Управление — управление механиками и администраторами (админ).\n\n"
         "Команды:\n"
         "/repairs [status] [page]\n"
         "/me [status] [page]\n"
@@ -1017,7 +1114,7 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data[UD_MODE] = "input_location_repair"
             await update.message.reply_text(
                 "Введи помещение текстом:",
-                reply_markup=ReplyKeyboardRemove(),
+                reply_markup=cancel_keyboard(),
             )
             return
 
@@ -1040,8 +1137,21 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ручной ввод помещения (после "Другое помещение…")
     if mode == "input_location_repair":
+        if text_in == LOC_CANCEL:
+            # отмена всего
+            context.user_data[UD_MODE] = None
+            context.user_data[UD_REPAIR_LOC] = None
+            context.user_data[UD_REPAIR_EQUIP] = None
+            context.user_data[UD_REPAIR_PRIORITY] = None
+
+            await update.message.reply_text(
+                "Отмена.",
+                reply_markup=await main_menu(db, uid),
+            )
+            return
+        
         manual_loc = text_in
-        if not manual_loc or manual_loc in (LOC_CANCEL, LOC_OTHER):
+        if not manual_loc or manual_loc in (LOC_OTHER,):
             await update.message.reply_text(
                 "Введи корректное название помещения или нажми «↩ Отмена».",
             )
@@ -1058,6 +1168,17 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ===== ШАГ 2. ВЫБОР ОБОРУДОВАНИЯ =====
     if mode == "choose_equipment":
+        if text_in == EQUIP_BACK:
+            # возвращаемся к выбору помещения
+            context.user_data[UD_MODE] = "choose_location_repair"
+            context.user_data[UD_REPAIR_EQUIP] = None
+            
+            await update.message.reply_text(
+                "Выбери помещение:",
+                reply_markup=locations_keyboard(),
+            )
+            return
+        
         if text_in == EQUIP_CANCEL:
             # отменяем создание заявки полностью
             context.user_data[UD_MODE] = None
@@ -1076,7 +1197,7 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data[UD_MODE] = "input_equipment_custom"
             await update.message.reply_text(
                 "Введи оборудование/узел текстом:",
-                reply_markup=ReplyKeyboardRemove(),
+                reply_markup=cancel_keyboard(),
             )
             return
 
@@ -1099,8 +1220,21 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ручной ввод оборудования (после "Другое оборудование…")
     if mode == "input_equipment_custom":
+        if text_in == LOC_CANCEL:
+            # отмена всего
+            context.user_data[UD_MODE] = None
+            context.user_data[UD_REPAIR_LOC] = None
+            context.user_data[UD_REPAIR_EQUIP] = None
+            context.user_data[UD_REPAIR_PRIORITY] = None
+
+            await update.message.reply_text(
+                "Отмена.",
+                reply_markup=await main_menu(db, uid),
+            )
+            return
+        
         manual_equipment = text_in
-        if not manual_equipment or manual_equipment in (EQUIP_OTHER, EQUIP_CANCEL):
+        if not manual_equipment or manual_equipment in (EQUIP_OTHER,):
             await update.message.reply_text(
                 "Введи корректное название оборудования или нажми «↩ Отмена».",
             )
@@ -1117,6 +1251,18 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ===== ШАГ 3. ВЫБОР ПРИОРИТЕТА =====
     if mode == "choose_priority_repair":
+        if text_in == LOC_BACK:
+            # возвращаемся к выбору оборудования
+            chosen_loc = context.user_data.get(UD_REPAIR_LOC)
+            context.user_data[UD_MODE] = "choose_equipment"
+            context.user_data[UD_REPAIR_PRIORITY] = None
+            
+            await update.message.reply_text(
+                f"Помещение: {chosen_loc}\n\nВыбери оборудование:",
+                reply_markup=equipment_keyboard(chosen_loc or ""),
+            )
+            return
+        
         if text_in == LOC_CANCEL:
             # отмена всего
             context.user_data[UD_MODE] = None
@@ -1133,7 +1279,6 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pr_map = {
             "🟢 Плановое (можно подождать)": "low",
             "🟡 Срочно, простой": "normal",
-            "🔴 Авария, линия стоит": "high",
         }
         if text_in in pr_map:
             context.user_data[UD_REPAIR_PRIORITY] = pr_map[text_in]
@@ -1161,7 +1306,7 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ===== МОИ ЗАЯВКИ =====
-    if text_in == "🧾 Мои заявки" and mode is None:
+    if text_in in ("🧾 Мои заявки", "🧾 Мои заявки на ремонт") and mode is None:
         rows = await find_tickets(db, user_id=uid, limit=20, offset=0)
         if not rows:
             await update.message.reply_text(
@@ -1280,6 +1425,54 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_journal(update, context)
         return
 
+    # ===== АНАЛИТИКА (быстрый доступ через кнопку) =====
+    if text_in == "📊 Аналитика" and mode is None:
+        if not await is_admin(db, uid):
+            await update.message.reply_text(
+                "Недостаточно прав.",
+                reply_markup=await main_menu(db, uid),
+            )
+            return
+        await cmd_analytics(update, context)
+        return
+
+    # ===== УПРАВЛЕНИЕ ПОЛЬЗОВАТЕЛЯМИ (быстрый доступ через кнопку) =====
+    if text_in == "👥 Управление" and mode is None:
+        if not await is_admin(db, uid):
+            await update.message.reply_text(
+                "Недостаточно прав.",
+                reply_markup=await main_menu(db, uid),
+            )
+            return
+        
+        # Показываем список команд управления
+        help_text = (
+            "👥 Управление механиками и администраторами\n\n"
+            "Доступные команды:\n\n"
+            "📝 Добавить механика:\n"
+            "/add_tech <user_id|@username>\n"
+            "Пример: /add_tech @ivan\n\n"
+            "👑 Добавить администратора:\n"
+            "/add_admin <user_id|@username>\n"
+            "Пример: /add_admin @maria\n\n"
+            "❌ Удалить механика/админа:\n"
+            "/remove_mechanic <user_id|@username>\n"
+            "Пример: /remove_mechanic @ivan\n\n"
+            "✏️ Установить отображаемое имя:\n"
+            "/set_mechanic_name <user_id|@username> <имя>\n"
+            "Пример: /set_mechanic_name @ivan Иван Петров\n\n"
+            "📋 Список ролей:\n"
+            "/roles\n\n"
+            "💡 Совет: Пользователь должен сначала написать боту /start, "
+            "чтобы попасть в систему."
+        )
+        
+        await update.message.reply_text(
+            help_text,
+            reply_markup=await main_menu(db, uid),
+        )
+        return
+
     # ===== РЕЖИМ ЗАКРЫТИЯ ЗАЯВКИ МЕХАНИКОМ (без фото) =====
     if mode == "await_done_photo":
         tid = context.user_data.get(UD_DONE_CTX)
@@ -1290,6 +1483,13 @@ async def on_text_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             context.user_data[UD_MODE] = None
             context.user_data[UD_DONE_CTX] = None
+            return
+
+        # Проверяем, что пользователь написал именно "готово"
+        if text_in.lower() not in ("готово", "done", "ok"):
+            await update.message.reply_text(
+                "Пришли фото результата или напиши 'готово'.",
+            )
             return
 
         t = await get_ticket(db, tid)
@@ -1674,10 +1874,27 @@ async def notify_admins_ticket(context: ContextTypes.DEFAULT_TYPE, author_uid: i
     Берём самую свежую заявку автора и шлём админам карточку с инлайн-кнопками администратора.
     """
     db = context.application.bot_data["db"]
-    rows = await find_tickets(db, user_id=author_uid, limit=1, offset=0)
-    if not rows:
-        return
-    t = rows[0]
+    # Берём самую последнюю заявку (с максимальным ID)
+    async with db.execute(
+        "SELECT id, kind, status, priority, chat_id, user_id, username, description, "
+        "photo_file_id, done_photo_file_id, assignee_id, assignee_name, "
+        "location, equipment, reason, created_at, updated_at, started_at, done_at "
+        "FROM tickets WHERE user_id=? ORDER BY id DESC LIMIT 1",
+        (author_uid,)
+    ) as cur:
+        row = await cur.fetchone()
+        if not row:
+            return
+        t = {
+            "id": row[0], "kind": row[1], "status": row[2], "priority": row[3],
+            "chat_id": row[4], "user_id": row[5], "username": row[6], "description": row[7],
+            "photo_file_id": row[8], "done_photo_file_id": row[9],
+            "assignee_id": row[10], "assignee_name": row[11],
+            "location": row[12], "equipment": row[13], "reason": row[14],
+            "created_at": row[15], "updated_at": row[16],
+            "started_at": row[17], "done_at": row[18],
+        }
+    
     admins, _techs = await db_list_roles(db)
     for aid in admins:
         kb = ticket_inline_kb(t, is_admin_flag=True, me_id=aid)
@@ -1689,10 +1906,27 @@ async def notify_techs_ticket(context: ContextTypes.DEFAULT_TYPE, author_uid: in
     То же самое, но отправляем механикам карточку с кнопками механика.
     """
     db = context.application.bot_data["db"]
-    rows = await find_tickets(db, user_id=author_uid, limit=1, offset=0)
-    if not rows:
-        return
-    t = rows[0]
+    # Берём самую последнюю заявку (с максимальным ID)
+    async with db.execute(
+        "SELECT id, kind, status, priority, chat_id, user_id, username, description, "
+        "photo_file_id, done_photo_file_id, assignee_id, assignee_name, "
+        "location, equipment, reason, created_at, updated_at, started_at, done_at "
+        "FROM tickets WHERE user_id=? ORDER BY id DESC LIMIT 1",
+        (author_uid,)
+    ) as cur:
+        row = await cur.fetchone()
+        if not row:
+            return
+        t = {
+            "id": row[0], "kind": row[1], "status": row[2], "priority": row[3],
+            "chat_id": row[4], "user_id": row[5], "username": row[6], "description": row[7],
+            "photo_file_id": row[8], "done_photo_file_id": row[9],
+            "assignee_id": row[10], "assignee_name": row[11],
+            "location": row[12], "equipment": row[13], "reason": row[14],
+            "created_at": row[15], "updated_at": row[16],
+            "started_at": row[17], "done_at": row[18],
+        }
+    
     _admins, techs = await db_list_roles(db)
     for tid in techs:
         kb = ticket_inline_kb(t, is_admin_flag=False, me_id=tid)
@@ -1743,7 +1977,7 @@ async def export_rows(db, start_iso: str):
             reason, description
         FROM tickets
         WHERE created_at >= ?
-        ORDER BY id DESC
+        ORDER BY id ASC
         """,
         (start_iso,),
     ) as cur:
@@ -1881,7 +2115,7 @@ async def cmd_journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         WHERE kind='repair'
           AND status IN ('in_work','done','rejected')
           AND updated_at >= ?
-        ORDER BY updated_at DESC
+        ORDER BY updated_at ASC
         """,
         (since.isoformat(),),
     ) as cur:
@@ -2216,6 +2450,284 @@ async def cmd_roles(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
+async def cmd_add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /add_admin <user_id|@username>
+    Только админ. Выдаёт роль администратора.
+    """
+    db = context.application.bot_data["db"]
+    uid = update.effective_user.id
+
+    if not await is_admin(db, uid):
+        await update.message.reply_text("Недостаточно прав.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Использование: /add_admin <user_id|@username>\n"
+            "(Пользователь должен сначала написать боту /start.)"
+        )
+        return
+
+    arg = context.args[0].strip()
+    target = ensure_int(arg)
+    if not target and arg.startswith("@"):
+        target = await db_lookup_uid_by_username(db, arg)
+    if not target:
+        await update.message.reply_text(
+            "Укажи числовой user_id или @username (после того, как пользователь написал боту /start)."
+        )
+        return
+
+    await db_add_user_role(db, target, "admin")
+    await update.message.reply_text(
+        f"Пользователь {target} добавлен как администратор."
+    )
+
+
+async def cmd_remove_mechanic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /remove_mechanic <user_id|@username>
+    Только админ. Удаляет механика из системы.
+    """
+    db = context.application.bot_data["db"]
+    uid = update.effective_user.id
+
+    if not await is_admin(db, uid):
+        await update.message.reply_text("Недостаточно прав.")
+        return
+
+    if not context.args:
+        await update.message.reply_text(
+            "Использование: /remove_mechanic <user_id|@username>\n"
+            "Удаляет пользователя из списка механиков/администраторов."
+        )
+        return
+
+    arg = context.args[0].strip()
+    target = ensure_int(arg)
+    if not target and arg.startswith("@"):
+        target = await db_lookup_uid_by_username(db, arg)
+    if not target:
+        await update.message.reply_text(
+            "Укажи числовой user_id или @username."
+        )
+        return
+
+    # Проверяем, что это не захардкоженный админ
+    if target in HARD_ADMIN_IDS:
+        await update.message.reply_text(
+            f"Нельзя удалить захардкоженного администратора ({target})."
+        )
+        return
+
+    await db_remove_user_role(db, target)
+    await update.message.reply_text(
+        f"Пользователь {target} удален из системы (больше не механик/админ)."
+    )
+
+
+async def cmd_set_mechanic_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /set_mechanic_name <user_id|@username> <отображаемое имя>
+    Только админ. Устанавливает отображаемое имя для механика.
+    """
+    db = context.application.bot_data["db"]
+    uid = update.effective_user.id
+
+    if not await is_admin(db, uid):
+        await update.message.reply_text("Недостаточно прав.")
+        return
+
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Использование: /set_mechanic_name <user_id|@username> <отображаемое имя>\n"
+            "Пример: /set_mechanic_name @ivan Иван Петров\n"
+            "Или: /set_mechanic_name 123456789 Иван Петров"
+        )
+        return
+
+    # Первый аргумент - user_id или @username
+    arg = context.args[0].strip()
+    target = ensure_int(arg)
+    if not target and arg.startswith("@"):
+        target = await db_lookup_uid_by_username(db, arg)
+    if not target:
+        await update.message.reply_text(
+            "Укажи числовой user_id или @username (пользователь должен сначала написать боту /start)."
+        )
+        return
+
+    # Остальные аргументы - отображаемое имя
+    display_name = " ".join(context.args[1:]).strip()
+    if not display_name:
+        await update.message.reply_text("Укажи отображаемое имя механика.")
+        return
+
+    # Проверяем, что пользователь является механиком или админом
+    if not await is_tech(db, target):
+        await update.message.reply_text(
+            f"Пользователь {target} не является механиком или администратором.\n"
+            f"Сначала добавь его через /add_tech или /add_admin."
+        )
+        return
+
+    await db_set_display_name(db, target, display_name)
+    await update.message.reply_text(
+        f"Установлено отображаемое имя для {target}: {display_name}"
+    )
+
+
+async def cmd_analytics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /analytics или кнопка "📊 Аналитика"
+    Только админ. Показывает детальную статистику по заявкам:
+    - Общее количество заявок
+    - Статистика по помещениям
+    - Статистика по оборудованию
+    - Детализация по механикам с помещениями и оборудованием
+    """
+    db = context.application.bot_data["db"]
+    uid = update.effective_user.id
+
+    if not await is_admin(db, uid):
+        await update.message.reply_text(
+            "Недостаточно прав.",
+            reply_markup=await main_menu(db, uid),
+        )
+        return
+
+    # Общее количество заявок
+    async with db.execute("SELECT COUNT(*) FROM tickets") as cur:
+        row = await cur.fetchone()
+        total_tickets = row[0] if row else 0
+
+    # Количество заявок по типам
+    async with db.execute(
+        "SELECT kind, COUNT(*) FROM tickets GROUP BY kind"
+    ) as cur:
+        kind_stats = {kind: count async for kind, count in cur}
+
+    # Статистика по помещениям
+    async with db.execute(
+        """
+        SELECT location, COUNT(*) 
+        FROM tickets 
+        WHERE location IS NOT NULL AND kind='repair'
+        GROUP BY location
+        ORDER BY COUNT(*) DESC
+        LIMIT 10
+        """
+    ) as cur:
+        location_stats = []
+        async for loc, count in cur:
+            location_stats.append((loc, count))
+
+    # Статистика по оборудованию
+    async with db.execute(
+        """
+        SELECT equipment, COUNT(*) 
+        FROM tickets 
+        WHERE equipment IS NOT NULL AND kind='repair'
+        GROUP BY equipment
+        ORDER BY COUNT(*) DESC
+        LIMIT 10
+        """
+    ) as cur:
+        equipment_stats = []
+        async for equip, count in cur:
+            equipment_stats.append((equip, count))
+
+    # Детализированная статистика по механикам
+    async with db.execute(
+        """
+        SELECT assignee_id, assignee_name, 
+               location, equipment,
+               COUNT(*) as cnt
+        FROM tickets 
+        WHERE assignee_id IS NOT NULL 
+          AND kind='repair'
+          AND status IN ('done', 'in_work')
+        GROUP BY assignee_id, assignee_name, location, equipment
+        ORDER BY assignee_name, cnt DESC
+        """
+    ) as cur:
+        mechanic_details = []
+        async for aid, aname, loc, equip, count in cur:
+            mechanic_details.append((aid, aname, loc, equip, count))
+
+    # Общая статистика по механикам с разбивкой по статусам
+    async with db.execute(
+        """
+        SELECT assignee_id, assignee_name, 
+               SUM(CASE WHEN status = 'done' THEN 1 ELSE 0 END) as done_count,
+               SUM(CASE WHEN status = 'rejected' THEN 1 ELSE 0 END) as rejected_count,
+               COUNT(*) as total_count
+        FROM tickets 
+        WHERE assignee_id IS NOT NULL 
+        GROUP BY assignee_id, assignee_name
+        ORDER BY total_count DESC
+        """
+    ) as cur:
+        mechanic_totals = []
+        async for aid, aname, done_cnt, rejected_cnt, total_cnt in cur:
+            mechanic_totals.append((aid, aname, done_cnt, rejected_cnt, total_cnt))
+
+    # Формируем текст
+    repair_count = kind_stats.get(KIND_REPAIR, 0)
+    purchase_count = kind_stats.get(KIND_PURCHASE, 0)
+
+    text = f"📊 Аналитика\n\n"
+    text += f"Всего заявок: {total_tickets}\n"
+    text += f"  • Ремонт: {repair_count}\n"
+    text += f"  • Покупка: {purchase_count}\n\n"
+
+    # Статистика по помещениям
+    if location_stats:
+        text += "🏢 Топ помещений по заявкам:\n"
+        for loc, count in location_stats[:5]:
+            text += f"  • {loc}: {count} заявок\n"
+        text += "\n"
+
+    # Статистика по оборудованию
+    if equipment_stats:
+        text += "🔧 Топ оборудования по заявкам:\n"
+        for equip, count in equipment_stats[:5]:
+            text += f"  • {equip}: {count} заявок\n"
+        text += "\n"
+
+    # Статистика по механикам (общая)
+    if mechanic_totals:
+        text += "👷 Статистика по механикам:\n"
+        for aid, aname, done_cnt, rejected_cnt, total_cnt in mechanic_totals:
+            name_display = aname or str(aid)
+            text += f"\n{name_display}: {total_cnt} заявок\n"
+            text += f"  ✅ Выполнено: {done_cnt}\n"
+            text += f"  🛑 Отклонено: {rejected_cnt}\n"
+            
+            # Детализация по этому механику (топ помещения/оборудование)
+            mech_details = [
+                (loc, equip, cnt) 
+                for m_aid, m_aname, loc, equip, cnt in mechanic_details 
+                if m_aid == aid
+            ]
+            if mech_details:
+                text += f"  📍 Топ работ:\n"
+                for loc, equip, cnt in mech_details[:3]:  # топ-3
+                    loc_text = loc or "—"
+                    equip_text = equip or "—"
+                    text += f"    └ {loc_text} / {equip_text}: {cnt}\n"
+    else:
+        text += "Пока нет заявок, взятых механиками.\n"
+
+    # Разбиваем на части, если слишком длинный
+    for chunk in chunk_text(text, 4000):
+        await update.message.reply_text(
+            chunk,
+            reply_markup=await main_menu(db, uid) if chunk == text or chunk.endswith(text[-100:]) else None,
+        )
+
+
 # ======================
 # INLINE CALLBACK HANDLER
 # ======================
@@ -2269,9 +2781,11 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         kb = []
         row = []
         for i, tech_uid in enumerate(techs, start=1):
+            # Получаем отображаемое имя механика для кнопки
+            display_name = await get_mechanic_display_name(db, tech_uid)
             row.append(
                 InlineKeyboardButton(
-                    f"{tech_uid}", callback_data=f"assign_to:{tech_uid}"
+                    display_name, callback_data=f"assign_to:{tech_uid}"
                 )
             )
             if i % 3 == 0:
@@ -2301,11 +2815,14 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Не удалось определить заявку/пользователя.")
             return
 
+        # Получаем отображаемое имя механика
+        assignee_display = await get_mechanic_display_name(db, assignee)
+
         await update_ticket(
             db,
             tid,
             assignee_id=assignee,
-            assignee_name=str(assignee),
+            assignee_name=assignee_display,
         )
 
         await edit_message_text_or_caption(
@@ -2334,11 +2851,14 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not tid:
             return
 
+        # Получаем отображаемое имя механика
+        assignee_display = await get_mechanic_display_name(db, uid, uname)
+
         await update_ticket(
             db,
             tid,
             assignee_id=uid,
-            assignee_name=f"@{uname or uid}",
+            assignee_name=assignee_display,
         )
 
         await edit_message_text_or_caption(
@@ -2414,11 +2934,14 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # если ещё нет исполнителя — назначаем того, кто нажал
         if not t["assignee_id"]:
+            # Получаем отображаемое имя механика
+            assignee_display = await get_mechanic_display_name(db, uid, uname)
+            
             await update_ticket(
                 db,
                 tid,
                 assignee_id=uid,
-                assignee_name=f"@{uname or uid}",
+                assignee_name=assignee_display,
             )
 
         # ставим статус в работу и фиксируем started_at, если пусто
@@ -2437,18 +2960,19 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # уведомляем автора
         try:
+            mechanic_name = await get_mechanic_display_name(db, uid, uname)
             await context.bot.send_message(
                 chat_id=t["user_id"],
                 text=(
                     f"Твоя заявка #{tid} взята в работу механиком "
-                    f"@{uname or uid}."
+                    f"{mechanic_name}."
                 ),
             )
         except Exception as e:
             log.debug(f"Notify author start-work failed: {e}")
         return
 
-    # Механик жмёт «✅ Выполнено»
+    # Механик или администратор жмёт «✅ Выполнено»
     if data.startswith("done:"):
         tid = ensure_int(data.split(":", 1)[1])
         t = await get_ticket(db, tid)
@@ -2456,23 +2980,47 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("Некорректная заявка.")
             return
 
-        # закрывать может только исполнитель
-        if t.get("assignee_id") != uid:
-            await query.answer("Только исполнитель может закрыть заявку.")
+        # закрывать может исполнитель или администратор
+        user_is_admin = await is_admin(db, uid)
+        if t.get("assignee_id") != uid and not user_is_admin:
+            await query.answer("Только исполнитель или администратор может закрыть заявку.")
             return
 
-        # включаем режим ожидания фото/текста
-        context.user_data[UD_MODE] = "await_done_photo"
-        context.user_data[UD_DONE_CTX] = tid
+        # Если не было started_at, поставим сейчас
+        if not t.get("started_at"):
+            await update_ticket(
+                db,
+                tid,
+                started_at=now_local().isoformat(),
+            )
 
+        # Закрываем заявку
+        await update_ticket(
+            db,
+            tid,
+            status=STATUS_DONE,
+            done_at=now_local().isoformat(),
+        )
+
+        await query.answer("Заявка выполнена ✅")
+        
         await edit_message_text_or_caption(
             query,
             (query.message.caption or query.message.text or "")
-            + "\n\nПришли фото результата или напиши 'готово'.",
+            + "\n\nСтатус: ✅ Выполнена",
         )
+
+        # Уведомляем автора
+        try:
+            await context.bot.send_message(
+                chat_id=t["user_id"],
+                text=f"Твоя заявка #{tid} отмечена как выполненная.",
+            )
+        except Exception as e:
+            log.debug(f"Notify author done failed: {e}")
         return
 
-    # Механик жмёт «🛑 Отказ (с комментарием)»
+    # Механик или администратор жмёт «🛑 Отказ (с комментарием)»
     if data.startswith("decline:"):
         tid = ensure_int(data.split(":", 1)[1])
         if not tid:
@@ -2481,8 +3029,11 @@ async def cb_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not t or t["kind"] != KIND_REPAIR:
             await query.answer("Некорректная заявка.")
             return
-        if t.get("assignee_id") != uid:
-            await query.answer("Только исполнитель может отказать по заявке.")
+        
+        # Отказать может исполнитель или администратор
+        user_is_admin = await is_admin(db, uid)
+        if t.get("assignee_id") != uid and not user_is_admin:
+            await query.answer("Только исполнитель или администратор может отказать по заявке.")
             return
 
         context.user_data[UD_MODE] = "await_reason"
@@ -2701,7 +3252,13 @@ def build_application() -> Application:
     """
     Создаём Application, регистрируем хендлеры.
     """
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .post_init(on_startup)
+        .post_shutdown(on_shutdown)
+        .build()
+    )
 
     # Команды
     app.add_handler(CommandHandler("start", cmd_start))
@@ -2717,7 +3274,11 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("mypurchases", cmd_mypurchases))
 
     app.add_handler(CommandHandler("add_tech", cmd_add_tech))
+    app.add_handler(CommandHandler("add_admin", cmd_add_admin))
+    app.add_handler(CommandHandler("remove_mechanic", cmd_remove_mechanic))
+    app.add_handler(CommandHandler("set_mechanic_name", cmd_set_mechanic_name))
     app.add_handler(CommandHandler("roles", cmd_roles))
+    app.add_handler(CommandHandler("analytics", cmd_analytics))
 
     # Инлайн-кнопки из карточек
     app.add_handler(CallbackQueryHandler(cb_handler))
@@ -2770,9 +3331,6 @@ def main():
     Точка входа.
     """
     app = build_application()
-    app.post_init.append(on_startup)
-    app.post_shutdown.append(on_shutdown)
-
     log.info("Starting bot polling...")
     app.run_polling(close_loop=False)
 
